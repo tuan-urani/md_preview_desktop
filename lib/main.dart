@@ -1,0 +1,2676 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
+import 'package:path/path.dart' as p;
+import 'package:url_launcher/url_launcher.dart';
+import 'package:watcher/watcher.dart';
+import 'package:window_manager/window_manager.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  if (Platform.isMacOS) {
+    await windowManager.ensureInitialized();
+
+    const windowOptions = WindowOptions(
+      size: Size(1280, 820),
+      minimumSize: Size(920, 560),
+      center: true,
+      title: 'MD Preview',
+      titleBarStyle: TitleBarStyle.hidden,
+      windowButtonVisibility: true,
+      backgroundColor: EditorColors.background,
+    );
+
+    windowManager.waitUntilReadyToShow(windowOptions, () async {
+      await windowManager.show();
+      await windowManager.focus();
+    });
+  }
+
+  runApp(const MdPreviewApp());
+}
+
+class MdPreviewApp extends StatelessWidget {
+  const MdPreviewApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'MD Preview',
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: EditorColors.accent,
+          brightness: Brightness.dark,
+          surface: EditorColors.background,
+        ),
+        fontFamily: 'SF Pro Text',
+        scaffoldBackgroundColor: EditorColors.background,
+        useMaterial3: true,
+      ),
+      home: const MarkdownStudioPage(),
+    );
+  }
+}
+
+class MarkdownStudioPage extends StatefulWidget {
+  const MarkdownStudioPage({super.key});
+
+  @override
+  State<MarkdownStudioPage> createState() => _MarkdownStudioPageState();
+}
+
+class MarkdownDocument {
+  MarkdownDocument({
+    required this.filePath,
+    required this.markdown,
+    required this.lastModified,
+    this.errorMessage,
+    this.isDirty = false,
+  });
+
+  final String filePath;
+  String markdown;
+  DateTime? lastModified;
+  String? errorMessage;
+  bool isDirty;
+
+  String get fileName => p.basename(filePath);
+  String get folderName => p.basename(p.dirname(filePath));
+}
+
+enum MarkdownViewMode { source, preview }
+
+enum EditorGroupId { primary, split }
+
+enum SplitDropSide { left, right }
+
+class MarkdownEditorTab {
+  const MarkdownEditorTab({required this.filePath, required this.viewMode});
+
+  final String filePath;
+  final MarkdownViewMode viewMode;
+}
+
+class EditorTabDragPayload {
+  const EditorTabDragPayload({required this.groupId, required this.tabIndex});
+
+  final EditorGroupId groupId;
+  final int tabIndex;
+}
+
+class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
+  static const double _defaultExplorerWidth = 250;
+  static const double _minExplorerWidth = 180;
+  static const double _maxExplorerWidth = 420;
+  static const Duration _autoSaveDelay = Duration(milliseconds: 700);
+
+  final GlobalKey _editorAreaKey = GlobalKey();
+
+  StreamSubscription<WatchEvent>? _watchSubscription;
+  Timer? _reloadDebounce;
+  final Map<String, Timer> _autoSaveDebounces = {};
+
+  final List<MarkdownDocument> _documents = [];
+  final List<MarkdownEditorTab> _tabs = [];
+  final List<MarkdownEditorTab> _splitTabs = [];
+  int _activeTabIndex = -1;
+  int _activeSplitTabIndex = -1;
+  EditorGroupId _activeGroupId = EditorGroupId.primary;
+  SplitDropSide _splitSide = SplitDropSide.right;
+  SplitDropSide? _dragSplitSide;
+  double _leftEditorFraction = 0.5;
+  bool _isLoading = false;
+  bool _autoReload = true;
+  bool _isExplorerVisible = true;
+  double _explorerWidth = _defaultExplorerWidth;
+
+  MarkdownEditorTab? get _activeTab {
+    final tabs = _tabsForGroup(_activeGroupId);
+    final activeIndex = _activeIndexForGroup(_activeGroupId);
+
+    if (activeIndex < 0 || activeIndex >= tabs.length) {
+      return null;
+    }
+
+    return tabs[activeIndex];
+  }
+
+  MarkdownDocument? get _activeDocument {
+    final filePath = _activeTab?.filePath;
+    if (filePath == null) {
+      return null;
+    }
+
+    return _documentForPath(filePath);
+  }
+
+  MarkdownViewMode get _activeViewMode =>
+      _activeTab?.viewMode ?? MarkdownViewMode.preview;
+
+  String? get _filePath => _activeDocument?.filePath;
+  String get _markdown => _activeDocument?.markdown ?? '';
+  DateTime? get _lastModified => _activeDocument?.lastModified;
+
+  @override
+  void initState() {
+    super.initState();
+    NativeFileOpenBridge.attach(onOpenFiles: _openNativeFiles);
+  }
+
+  @override
+  void dispose() {
+    _reloadDebounce?.cancel();
+    for (final timer in _autoSaveDebounces.values) {
+      timer.cancel();
+    }
+    _watchSubscription?.cancel();
+    super.dispose();
+  }
+
+  void _openNativeFiles(List<String> paths) {
+    if (paths.isEmpty) {
+      return;
+    }
+
+    final markdownPaths = paths.where(_isMarkdownPath).toList();
+    unawaited(_openFiles(markdownPaths.isEmpty ? paths : markdownPaths));
+  }
+
+  Future<void> _openFiles(Iterable<String> filePaths) async {
+    for (final filePath in filePaths) {
+      await _openFile(filePath);
+    }
+  }
+
+  Future<void> _pickFile() async {
+    final result = await FilePicker.pickFiles(
+      dialogTitle: 'Open Markdown File',
+      type: FileType.custom,
+      allowedExtensions: const ['md', 'markdown', 'mdown', 'mkd', 'txt'],
+      allowMultiple: true,
+      withData: false,
+    );
+
+    final selectedPaths =
+        result?.files
+            .map((file) => file.path)
+            .whereType<String>()
+            .toList(growable: false) ??
+        const <String>[];
+
+    if (selectedPaths.isEmpty) {
+      return;
+    }
+
+    await _openFiles(selectedPaths);
+  }
+
+  Future<void> _openFile(String filePath) async {
+    final normalizedPath = File(filePath).absolute.path;
+    final existingIndex = _indexOfDocument(normalizedPath);
+    _cancelAutoSave(normalizedPath);
+
+    setState(() {
+      if (existingIndex != -1) {
+        _ensureEditorTabsForFile(normalizedPath);
+        _activeTabIndex = _indexOfTab(normalizedPath, MarkdownViewMode.preview);
+        _activeGroupId = EditorGroupId.primary;
+      }
+      _isLoading = true;
+    });
+
+    try {
+      final file = File(normalizedPath);
+      if (!await file.exists()) {
+        throw FileSystemException('File does not exist', normalizedPath);
+      }
+
+      final text = await file.readAsString();
+      final stat = await file.stat();
+
+      if (!mounted) {
+        return;
+      }
+
+      final updatedDocument = MarkdownDocument(
+        filePath: normalizedPath,
+        markdown: text,
+        lastModified: stat.modified,
+      );
+
+      setState(() {
+        final index = _indexOfDocument(normalizedPath);
+        if (index == -1) {
+          _documents.add(updatedDocument);
+        } else {
+          _documents[index] = updatedDocument;
+        }
+        _ensureEditorTabsForFile(normalizedPath);
+        _activeTabIndex = _indexOfTab(normalizedPath, MarkdownViewMode.preview);
+        _activeGroupId = EditorGroupId.primary;
+        _isLoading = false;
+      });
+
+      await _restartWatcherForActiveDocument();
+      await _setWindowTitle(normalizedPath);
+    } on Object catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        final index = _indexOfDocument(normalizedPath);
+        final failedDocument = MarkdownDocument(
+          filePath: normalizedPath,
+          markdown: '',
+          lastModified: null,
+          errorMessage: error.toString(),
+        );
+
+        if (index == -1) {
+          _documents.add(failedDocument);
+        } else {
+          _documents[index] = failedDocument;
+        }
+        _ensureEditorTabsForFile(normalizedPath);
+        _activeTabIndex = _indexOfTab(normalizedPath, MarkdownViewMode.preview);
+        _activeGroupId = EditorGroupId.primary;
+        _isLoading = false;
+      });
+
+      await _restartWatcherForActiveDocument();
+      await _setWindowTitle(normalizedPath);
+    }
+  }
+
+  Future<void> _reloadCurrentFile({bool silent = false}) async {
+    final filePath = _filePath;
+    if (filePath == null) {
+      return;
+    }
+
+    await _reloadFile(filePath, silent: silent);
+  }
+
+  Future<void> _reloadFile(String filePath, {bool silent = false}) async {
+    final document = _documentForPath(filePath);
+    if (silent &&
+        (document?.isDirty == true || _hasPendingAutoSave(filePath))) {
+      return;
+    }
+
+    if (!silent && mounted) {
+      setState(() {
+        _isLoading = true;
+      });
+    }
+
+    try {
+      final file = File(filePath);
+      final text = await file.readAsString();
+      final stat = await file.stat();
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        final index = _indexOfDocument(filePath);
+        if (index != -1) {
+          _documents[index].markdown = text;
+          _documents[index].lastModified = stat.modified;
+          _documents[index].errorMessage = null;
+          _documents[index].isDirty = false;
+        }
+        _isLoading = false;
+      });
+    } on Object catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        final index = _indexOfDocument(filePath);
+        if (index != -1) {
+          _documents[index].errorMessage = error.toString();
+        }
+        _isLoading = false;
+      });
+    }
+  }
+
+  Future<void> _saveActiveFile() async {
+    final activeDocument = _activeDocument;
+    if (activeDocument == null) {
+      return;
+    }
+
+    _cancelAutoSave(activeDocument.filePath);
+    await _saveDocument(activeDocument.filePath);
+  }
+
+  Future<void> _saveDocument(String filePath) async {
+    final documentIndex = _indexOfDocument(filePath);
+    if (documentIndex == -1) {
+      return;
+    }
+
+    final markdownToSave = _documents[documentIndex].markdown;
+
+    try {
+      final file = File(filePath);
+      await file.writeAsString(markdownToSave);
+      final stat = await file.stat();
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        final index = _indexOfDocument(filePath);
+        if (index != -1) {
+          _documents[index].lastModified = stat.modified;
+          _documents[index].errorMessage = null;
+          if (_documents[index].markdown == markdownToSave) {
+            _documents[index].isDirty = false;
+          }
+        }
+      });
+    } on Object catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        final index = _indexOfDocument(filePath);
+        if (index != -1) {
+          _documents[index].errorMessage = error.toString();
+        }
+      });
+    }
+  }
+
+  void _updateDocumentMarkdown(String filePath, String markdown) {
+    final index = _indexOfDocument(filePath);
+    if (index == -1) {
+      return;
+    }
+
+    if (_documents[index].markdown == markdown) {
+      return;
+    }
+
+    setState(() {
+      _documents[index].markdown = markdown;
+      _documents[index].errorMessage = null;
+      _documents[index].isDirty = true;
+    });
+
+    _scheduleAutoSave(filePath);
+  }
+
+  void _scheduleAutoSave(String filePath) {
+    _autoSaveDebounces[filePath]?.cancel();
+    _autoSaveDebounces[filePath] = Timer(_autoSaveDelay, () {
+      _autoSaveDebounces.remove(filePath);
+      unawaited(_saveDocument(filePath));
+    });
+  }
+
+  void _cancelAutoSave(String filePath) {
+    _autoSaveDebounces.remove(filePath)?.cancel();
+  }
+
+  bool _hasPendingAutoSave(String filePath) {
+    return _autoSaveDebounces.containsKey(filePath);
+  }
+
+  void _startWatching(String filePath) {
+    if (!_autoReload) {
+      return;
+    }
+
+    _watchSubscription = FileWatcher(filePath).events.listen((event) {
+      if (event.type == ChangeType.MODIFY) {
+        _reloadDebounce?.cancel();
+        _reloadDebounce = Timer(
+          const Duration(milliseconds: 180),
+          () => _reloadFile(filePath, silent: true),
+        );
+      }
+    });
+  }
+
+  Future<void> _restartWatcherForActiveDocument() async {
+    await _watchSubscription?.cancel();
+    _watchSubscription = null;
+
+    final filePath = _filePath;
+    if (filePath != null) {
+      _startWatching(filePath);
+    }
+  }
+
+  Future<void> _setWindowTitle(String? filePath) async {
+    if (!Platform.isMacOS) {
+      return;
+    }
+
+    final title =
+        filePath == null
+            ? 'MD Preview'
+            : '${p.basename(filePath)} - MD Preview';
+    await windowManager.setTitle(title);
+  }
+
+  void _setAutoReload(bool value) {
+    setState(() {
+      _autoReload = value;
+    });
+
+    unawaited(_restartWatcherForActiveDocument());
+  }
+
+  void _toggleExplorer() {
+    setState(() {
+      _isExplorerVisible = !_isExplorerVisible;
+    });
+  }
+
+  void _resizeExplorerByDelta(double delta) {
+    setState(() {
+      _explorerWidth =
+          (_explorerWidth + delta)
+              .clamp(_minExplorerWidth, _maxExplorerWidth)
+              .toDouble();
+    });
+  }
+
+  void _resetExplorerWidth() {
+    setState(() {
+      _explorerWidth = _defaultExplorerWidth;
+    });
+  }
+
+  void _activateEditorTab(EditorGroupId groupId, int index) {
+    final tabs = _tabsForGroup(groupId);
+    if (index < 0 || index >= tabs.length) {
+      return;
+    }
+
+    if (groupId == _activeGroupId && index == _activeIndexForGroup(groupId)) {
+      return;
+    }
+
+    setState(() {
+      _activeGroupId = groupId;
+      _setActiveIndexForGroup(groupId, index);
+      _isLoading = false;
+    });
+
+    unawaited(_restartWatcherForActiveDocument());
+    unawaited(_setWindowTitle(_filePath));
+  }
+
+  void _activateOrOpenSiblingTab() {
+    final filePath = _filePath;
+    if (filePath == null) {
+      return;
+    }
+
+    final nextViewMode =
+        _activeViewMode == MarkdownViewMode.source
+            ? MarkdownViewMode.preview
+            : MarkdownViewMode.source;
+
+    var tabIndex = _indexOfTabInGroup(_activeGroupId, filePath, nextViewMode);
+    if (tabIndex == -1) {
+      setState(() {
+        final tabs = _tabsForGroup(_activeGroupId);
+        tabs.add(MarkdownEditorTab(filePath: filePath, viewMode: nextViewMode));
+        tabIndex = tabs.length - 1;
+      });
+    }
+
+    _activateEditorTab(_activeGroupId, tabIndex);
+  }
+
+  void _closeEditorTab(EditorGroupId groupId, int tabIndex) {
+    final tabs = _tabsForGroup(groupId);
+    if (tabIndex < 0 || tabIndex >= tabs.length) {
+      return;
+    }
+
+    setState(() {
+      tabs.removeAt(tabIndex);
+
+      _normalizeActiveIndexForGroup(groupId, removedIndex: tabIndex);
+      _normalizeActiveGroupAfterTabChange();
+
+      _isLoading = false;
+    });
+
+    unawaited(_restartWatcherForActiveDocument());
+    unawaited(_setWindowTitle(_filePath));
+  }
+
+  void _activateDocumentFromExplorer(String filePath) {
+    final activeGroupIndex = _indexOfTabInGroup(
+      _activeGroupId,
+      filePath,
+      _activeViewMode,
+    );
+    if (activeGroupIndex != -1) {
+      _activateEditorTab(_activeGroupId, activeGroupIndex);
+      return;
+    }
+
+    for (final groupId in [EditorGroupId.primary, EditorGroupId.split]) {
+      final previewIndex = _indexOfTabInGroup(
+        groupId,
+        filePath,
+        MarkdownViewMode.preview,
+      );
+      if (previewIndex != -1) {
+        _activateEditorTab(groupId, previewIndex);
+        return;
+      }
+
+      final sourceIndex = _indexOfTabInGroup(
+        groupId,
+        filePath,
+        MarkdownViewMode.source,
+      );
+      if (sourceIndex != -1) {
+        _activateEditorTab(groupId, sourceIndex);
+        return;
+      }
+    }
+
+    setState(() {
+      _ensureEditorTabsForFile(filePath);
+      _activeGroupId = EditorGroupId.primary;
+      _activeTabIndex = _indexOfTab(filePath, MarkdownViewMode.preview);
+      _isLoading = false;
+    });
+
+    unawaited(_restartWatcherForActiveDocument());
+    unawaited(_setWindowTitle(_filePath));
+  }
+
+  void _removeDocumentFromExplorer(String filePath) {
+    final oldPrimaryActiveTab = _activeTabForGroup(EditorGroupId.primary);
+    final oldSplitActiveTab = _activeTabForGroup(EditorGroupId.split);
+    _cancelAutoSave(filePath);
+
+    setState(() {
+      _documents.removeWhere((document) => document.filePath == filePath);
+      _tabs.removeWhere((tab) => tab.filePath == filePath);
+      _splitTabs.removeWhere((tab) => tab.filePath == filePath);
+
+      _activeTabIndex = _resolveActiveIndexAfterRemoval(
+        _tabs,
+        _activeTabIndex,
+        oldPrimaryActiveTab,
+      );
+      _activeSplitTabIndex = _resolveActiveIndexAfterRemoval(
+        _splitTabs,
+        _activeSplitTabIndex,
+        oldSplitActiveTab,
+      );
+      _normalizeActiveGroupAfterTabChange();
+      _isLoading = false;
+    });
+
+    unawaited(_restartWatcherForActiveDocument());
+    unawaited(_setWindowTitle(_filePath));
+  }
+
+  void _reorderDocumentInExplorer(String filePath, int targetIndex) {
+    final currentIndex = _indexOfDocument(filePath);
+    if (currentIndex == -1) {
+      return;
+    }
+
+    setState(() {
+      final document = _documents.removeAt(currentIndex);
+      final adjustedTargetIndex =
+          currentIndex < targetIndex ? targetIndex - 1 : targetIndex;
+      final insertIndex = adjustedTargetIndex.clamp(0, _documents.length);
+      _documents.insert(insertIndex, document);
+    });
+  }
+
+  int _indexOfDocument(String filePath) {
+    return _documents.indexWhere((document) => document.filePath == filePath);
+  }
+
+  MarkdownDocument? _documentForPath(String filePath) {
+    final index = _indexOfDocument(filePath);
+    if (index == -1) {
+      return null;
+    }
+
+    return _documents[index];
+  }
+
+  List<MarkdownEditorTab> _tabsForGroup(EditorGroupId groupId) {
+    return switch (groupId) {
+      EditorGroupId.primary => _tabs,
+      EditorGroupId.split => _splitTabs,
+    };
+  }
+
+  int _activeIndexForGroup(EditorGroupId groupId) {
+    return switch (groupId) {
+      EditorGroupId.primary => _activeTabIndex,
+      EditorGroupId.split => _activeSplitTabIndex,
+    };
+  }
+
+  void _setActiveIndexForGroup(EditorGroupId groupId, int index) {
+    switch (groupId) {
+      case EditorGroupId.primary:
+        _activeTabIndex = index;
+      case EditorGroupId.split:
+        _activeSplitTabIndex = index;
+    }
+  }
+
+  int _indexOfTab(String filePath, MarkdownViewMode viewMode) {
+    return _tabs.indexWhere(
+      (tab) => tab.filePath == filePath && tab.viewMode == viewMode,
+    );
+  }
+
+  MarkdownEditorTab? _activeTabForGroup(EditorGroupId groupId) {
+    final tabs = _tabsForGroup(groupId);
+    final activeIndex = _activeIndexForGroup(groupId);
+    if (activeIndex < 0 || activeIndex >= tabs.length) {
+      return null;
+    }
+
+    return tabs[activeIndex];
+  }
+
+  int _resolveActiveIndexAfterRemoval(
+    List<MarkdownEditorTab> tabs,
+    int previousIndex,
+    MarkdownEditorTab? previousActiveTab,
+  ) {
+    if (tabs.isEmpty) {
+      return -1;
+    }
+
+    if (previousActiveTab != null) {
+      final preservedIndex = tabs.indexWhere(
+        (tab) =>
+            tab.filePath == previousActiveTab.filePath &&
+            tab.viewMode == previousActiveTab.viewMode,
+      );
+      if (preservedIndex != -1) {
+        return preservedIndex;
+      }
+    }
+
+    return previousIndex.clamp(0, tabs.length - 1).toInt();
+  }
+
+  int _indexOfTabInGroup(
+    EditorGroupId groupId,
+    String filePath,
+    MarkdownViewMode viewMode,
+  ) {
+    return _tabsForGroup(
+      groupId,
+    ).indexWhere((tab) => tab.filePath == filePath && tab.viewMode == viewMode);
+  }
+
+  void _ensureEditorTabsForFile(String filePath) {
+    if (_indexOfTab(filePath, MarkdownViewMode.source) == -1) {
+      _tabs.add(
+        MarkdownEditorTab(
+          filePath: filePath,
+          viewMode: MarkdownViewMode.source,
+        ),
+      );
+    }
+
+    if (_indexOfTab(filePath, MarkdownViewMode.preview) == -1) {
+      _tabs.add(
+        MarkdownEditorTab(
+          filePath: filePath,
+          viewMode: MarkdownViewMode.preview,
+        ),
+      );
+    }
+  }
+
+  void _normalizeActiveIndexForGroup(
+    EditorGroupId groupId, {
+    required int removedIndex,
+  }) {
+    final tabs = _tabsForGroup(groupId);
+    final activeIndex = _activeIndexForGroup(groupId);
+
+    if (tabs.isEmpty) {
+      _setActiveIndexForGroup(groupId, -1);
+    } else if (removedIndex < activeIndex) {
+      _setActiveIndexForGroup(groupId, activeIndex - 1);
+    } else if (removedIndex == activeIndex) {
+      _setActiveIndexForGroup(
+        groupId,
+        removedIndex >= tabs.length ? tabs.length - 1 : removedIndex,
+      );
+    } else if (activeIndex >= tabs.length) {
+      _setActiveIndexForGroup(groupId, tabs.length - 1);
+    }
+  }
+
+  void _normalizeActiveGroupAfterTabChange() {
+    if (_tabsForGroup(_activeGroupId).isNotEmpty) {
+      return;
+    }
+
+    if (_tabs.isNotEmpty) {
+      _activeGroupId = EditorGroupId.primary;
+    } else if (_splitTabs.isNotEmpty) {
+      _activeGroupId = EditorGroupId.split;
+    } else {
+      _activeGroupId = EditorGroupId.primary;
+    }
+  }
+
+  void _moveTabToGroup(
+    EditorTabDragPayload payload,
+    EditorGroupId targetGroup,
+  ) {
+    final sourceTabs = _tabsForGroup(payload.groupId);
+    if (payload.tabIndex < 0 || payload.tabIndex >= sourceTabs.length) {
+      return;
+    }
+
+    final movingTab = sourceTabs[payload.tabIndex];
+    final existingTargetIndex = _indexOfTabInGroup(
+      targetGroup,
+      movingTab.filePath,
+      movingTab.viewMode,
+    );
+
+    setState(() {
+      if (payload.groupId == targetGroup) {
+        _activeGroupId = targetGroup;
+        _setActiveIndexForGroup(targetGroup, payload.tabIndex);
+        return;
+      }
+
+      sourceTabs.removeAt(payload.tabIndex);
+      _normalizeActiveIndexForGroup(
+        payload.groupId,
+        removedIndex: payload.tabIndex,
+      );
+
+      if (existingTargetIndex == -1) {
+        final targetTabs = _tabsForGroup(targetGroup);
+        targetTabs.add(movingTab);
+        _setActiveIndexForGroup(targetGroup, targetTabs.length - 1);
+      } else {
+        _setActiveIndexForGroup(targetGroup, existingTargetIndex);
+      }
+
+      _activeGroupId = targetGroup;
+      _normalizeActiveGroupAfterTabChange();
+      _isLoading = false;
+    });
+
+    unawaited(_restartWatcherForActiveDocument());
+    unawaited(_setWindowTitle(_filePath));
+  }
+
+  void _moveTabToEmptySide(
+    EditorTabDragPayload payload,
+    SplitDropSide droppedSide,
+  ) {
+    final targetGroup =
+        payload.groupId == EditorGroupId.primary
+            ? EditorGroupId.split
+            : EditorGroupId.primary;
+
+    final splitSide =
+        targetGroup == EditorGroupId.split
+            ? droppedSide
+            : _oppositeSplitSide(droppedSide);
+
+    setState(() {
+      _splitSide = splitSide;
+    });
+
+    _moveTabToGroup(payload, targetGroup);
+  }
+
+  SplitDropSide _oppositeSplitSide(SplitDropSide side) {
+    return side == SplitDropSide.left
+        ? SplitDropSide.right
+        : SplitDropSide.left;
+  }
+
+  void _reorderEditorTab(
+    EditorTabDragPayload payload,
+    EditorGroupId targetGroup,
+    int targetIndex,
+  ) {
+    final sourceTabs = _tabsForGroup(payload.groupId);
+    final targetTabs = _tabsForGroup(targetGroup);
+
+    if (payload.tabIndex < 0 || payload.tabIndex >= sourceTabs.length) {
+      return;
+    }
+
+    final movingTab = sourceTabs[payload.tabIndex];
+    if (payload.groupId == targetGroup && payload.tabIndex == targetIndex) {
+      _activateEditorTab(targetGroup, targetIndex);
+      return;
+    }
+
+    setState(() {
+      if (payload.groupId == targetGroup) {
+        sourceTabs.removeAt(payload.tabIndex);
+        final adjustedTargetIndex =
+            payload.tabIndex < targetIndex ? targetIndex - 1 : targetIndex;
+        final insertIndex = adjustedTargetIndex.clamp(0, sourceTabs.length);
+        sourceTabs.insert(insertIndex, movingTab);
+        _setActiveIndexForGroup(targetGroup, insertIndex);
+      } else {
+        final sourceActiveTab = _activeTabForGroup(payload.groupId);
+        sourceTabs.removeAt(payload.tabIndex);
+        _setActiveIndexForGroup(
+          payload.groupId,
+          _resolveActiveIndexAfterRemoval(
+            sourceTabs,
+            _activeIndexForGroup(payload.groupId),
+            sourceActiveTab,
+          ),
+        );
+
+        final existingTargetIndex = _indexOfTabInGroup(
+          targetGroup,
+          movingTab.filePath,
+          movingTab.viewMode,
+        );
+        if (existingTargetIndex == -1) {
+          final insertIndex = targetIndex.clamp(0, targetTabs.length);
+          targetTabs.insert(insertIndex, movingTab);
+          _setActiveIndexForGroup(targetGroup, insertIndex);
+        } else {
+          _setActiveIndexForGroup(targetGroup, existingTargetIndex);
+        }
+      }
+
+      _activeGroupId = targetGroup;
+      _normalizeActiveGroupAfterTabChange();
+      _isLoading = false;
+    });
+
+    unawaited(_restartWatcherForActiveDocument());
+    unawaited(_setWindowTitle(_filePath));
+  }
+
+  Future<void> _openMarkdownLinkForFile(String filePath, String? href) async {
+    if (href == null || href.trim().isEmpty) {
+      return;
+    }
+
+    final uri = Uri.tryParse(href);
+    if (uri != null && uri.hasScheme) {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+      return;
+    }
+
+    final targetWithoutFragment = href.split('#').first;
+    if (targetWithoutFragment.isEmpty) {
+      return;
+    }
+
+    final targetPath = p.normalize(
+      p.join(p.dirname(filePath), targetWithoutFragment),
+    );
+
+    if (_isMarkdownPath(targetPath) && await File(targetPath).exists()) {
+      await _openFile(targetPath);
+      return;
+    }
+
+    if (Platform.isMacOS && await File(targetPath).exists()) {
+      await Process.run('open', [targetPath]);
+    }
+  }
+
+  String _imageDirectoryForFile(String filePath) {
+    final directoryPath = '${p.dirname(filePath)}${Platform.pathSeparator}';
+    return Uri.file(directoryPath).toString();
+  }
+
+  String get _fileName {
+    final filePath = _filePath;
+    return filePath == null ? 'Welcome' : p.basename(filePath);
+  }
+
+  int get _lineCount {
+    if (_markdown.isEmpty) {
+      return 0;
+    }
+
+    return '\n'.allMatches(_markdown).length + 1;
+  }
+
+  int get _wordCount {
+    return RegExp(r'\S+').allMatches(_markdown).length;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final singleVisibleGroup = _singleVisibleEditorGroup;
+
+    return Scaffold(
+      body: ColoredBox(
+        color: EditorColors.background,
+        child: Column(
+          children: [
+            EditorWindowBar(
+              fileName: _fileName,
+              onOpenPressed: _pickFile,
+              onSavePressed:
+                  _activeDocument?.isDirty == true ? _saveActiveFile : null,
+              onReloadPressed:
+                  _filePath == null ? null : () => _reloadCurrentFile(),
+              activeViewMode: _activeViewMode,
+              onToggleViewMode:
+                  _filePath == null ? null : _activateOrOpenSiblingTab,
+            ),
+            Expanded(
+              child: Row(
+                children: [
+                  ActivityRail(
+                    isExplorerVisible: _isExplorerVisible,
+                    onExplorerPressed: _toggleExplorer,
+                  ),
+                  if (_isExplorerVisible) ...[
+                    SizedBox(
+                      width: _explorerWidth,
+                      child: ExplorerPane(
+                        documents: _documents,
+                        activeFilePath: _filePath,
+                        onOpenPressed: _pickFile,
+                        onSelectDocument: _activateDocumentFromExplorer,
+                        onRemoveDocument: _removeDocumentFromExplorer,
+                        onReorderDocument: _reorderDocumentInExplorer,
+                      ),
+                    ),
+                    SplitResizeDivider(
+                      onDragDelta: _resizeExplorerByDelta,
+                      onReset: _resetExplorerWidth,
+                    ),
+                  ],
+                  Expanded(
+                    child: Column(
+                      children: [
+                        if (singleVisibleGroup != null)
+                          _buildEditorTabBar(singleVisibleGroup),
+                        Expanded(
+                          child: _buildEditorGroups(
+                            showTabBar: singleVisibleGroup == null,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            StatusBar(
+              filePath: _filePath,
+              lineCount: _lineCount,
+              wordCount: _wordCount,
+              lastModified: _lastModified,
+              autoReload: _autoReload,
+              onAutoReloadChanged: _setAutoReload,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  EditorGroupId? get _singleVisibleEditorGroup {
+    if (_tabs.isEmpty && _splitTabs.isEmpty) {
+      return EditorGroupId.primary;
+    }
+
+    if (_tabs.isEmpty) {
+      return EditorGroupId.split;
+    }
+
+    if (_splitTabs.isEmpty) {
+      return EditorGroupId.primary;
+    }
+
+    return null;
+  }
+
+  Widget _buildEditorGroups({required bool showTabBar}) {
+    final singleVisibleGroup = _singleVisibleEditorGroup;
+    if (singleVisibleGroup != null) {
+      return _buildSingleEditorGroup(
+        singleVisibleGroup,
+        showTabBar: showTabBar,
+      );
+    }
+
+    final leftGroup =
+        _splitSide == SplitDropSide.left
+            ? EditorGroupId.split
+            : EditorGroupId.primary;
+    final rightGroup =
+        _splitSide == SplitDropSide.left
+            ? EditorGroupId.primary
+            : EditorGroupId.split;
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final availableWidth = constraints.maxWidth - SplitResizeDivider.width;
+        final leftWidth = availableWidth * _leftEditorFraction;
+        final rightWidth = availableWidth - leftWidth;
+
+        return Row(
+          children: [
+            SizedBox(width: leftWidth, child: _buildEditorGroup(leftGroup)),
+            SplitResizeDivider(
+              onDragDelta:
+                  (delta) => _resizeSplitByDelta(delta, constraints.maxWidth),
+              onReset: _resetSplitSize,
+            ),
+            SizedBox(width: rightWidth, child: _buildEditorGroup(rightGroup)),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildSingleEditorGroup(
+    EditorGroupId visibleGroup, {
+    required bool showTabBar,
+  }) {
+    return DragTarget<EditorTabDragPayload>(
+      onWillAcceptWithDetails:
+          (details) => details.data.groupId == visibleGroup,
+      onMove: _handleSplitPreviewDragMove,
+      onLeave: (_) => _setDragSplitSide(null),
+      onAcceptWithDetails: (details) {
+        final splitSide = _splitSideForOffset(details.offset);
+        _setDragSplitSide(null);
+
+        if (splitSide != null) {
+          _moveTabToEmptySide(details.data, splitSide);
+        }
+      },
+      builder: (context, candidateData, rejectedData) {
+        return Stack(
+          key: _editorAreaKey,
+          fit: StackFit.expand,
+          children: [
+            Positioned.fill(
+              child: _buildEditorGroup(visibleGroup, showTabBar: showTabBar),
+            ),
+            if (_dragSplitSide != null)
+              Positioned.fill(
+                child: SplitPreviewOverlay(side: _dragSplitSide!),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _handleSplitPreviewDragMove(
+    DragTargetDetails<EditorTabDragPayload> details,
+  ) {
+    _setDragSplitSide(_splitSideForOffset(details.offset));
+  }
+
+  SplitDropSide? _splitSideForOffset(Offset globalOffset) {
+    final context = _editorAreaKey.currentContext;
+    if (context == null) {
+      return null;
+    }
+
+    final renderBox = context.findRenderObject();
+    if (renderBox is! RenderBox || !renderBox.hasSize) {
+      return null;
+    }
+
+    final localOffset = renderBox.globalToLocal(globalOffset);
+    if (localOffset.dx < 0 ||
+        localOffset.dx > renderBox.size.width ||
+        localOffset.dy < 0 ||
+        localOffset.dy > renderBox.size.height) {
+      return null;
+    }
+
+    return localOffset.dx < renderBox.size.width / 2
+        ? SplitDropSide.left
+        : SplitDropSide.right;
+  }
+
+  void _setDragSplitSide(SplitDropSide? side) {
+    if (_dragSplitSide == side) {
+      return;
+    }
+
+    setState(() {
+      _dragSplitSide = side;
+    });
+  }
+
+  void _resizeSplitByDelta(double delta, double totalWidth) {
+    final availableWidth = totalWidth - SplitResizeDivider.width;
+    if (availableWidth <= 0) {
+      return;
+    }
+
+    setState(() {
+      _leftEditorFraction =
+          (_leftEditorFraction + delta / availableWidth)
+              .clamp(0.18, 0.82)
+              .toDouble();
+    });
+  }
+
+  void _resetSplitSize() {
+    setState(() {
+      _leftEditorFraction = 0.5;
+    });
+  }
+
+  Widget _buildEditorTabBar(EditorGroupId groupId) {
+    final tabs = _tabsForGroup(groupId);
+    final activeIndex = _activeIndexForGroup(groupId);
+
+    return EditorTabBar(
+      documents: _documents,
+      tabs: tabs,
+      activeTabIndex: activeIndex,
+      groupId: groupId,
+      onSelectTab: (index) => _activateEditorTab(groupId, index),
+      onCloseTab: (index) => _closeEditorTab(groupId, index),
+      onReorderTab:
+          (payload, targetIndex) =>
+              _reorderEditorTab(payload, groupId, targetIndex),
+    );
+  }
+
+  Widget _buildEditorGroup(EditorGroupId groupId, {bool showTabBar = true}) {
+    return Column(
+      children: [
+        if (showTabBar) _buildEditorTabBar(groupId),
+        Expanded(
+          child: DragTarget<EditorTabDragPayload>(
+            onWillAcceptWithDetails:
+                (details) => details.data.groupId != groupId,
+            onAcceptWithDetails:
+                (details) => _moveTabToGroup(details.data, groupId),
+            builder: (context, candidateData, rejectedData) {
+              final isHovering = candidateData.isNotEmpty;
+
+              return DecoratedBox(
+                decoration: BoxDecoration(
+                  border: Border.all(
+                    color:
+                        isHovering ? EditorColors.accent : Colors.transparent,
+                    width: 2,
+                  ),
+                ),
+                child: _buildEditorContentForGroup(groupId),
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildEditorContentForGroup(EditorGroupId groupId) {
+    final tabs = _tabsForGroup(groupId);
+    final activeIndex = _activeIndexForGroup(groupId);
+
+    if (tabs.isEmpty || activeIndex < 0 || activeIndex >= tabs.length) {
+      return EmptyEditorState(onOpenPressed: _pickFile);
+    }
+
+    final activeTab = tabs[activeIndex];
+    final activeDocument = _documentForPath(activeTab.filePath);
+
+    if (_isLoading && activeDocument == null) {
+      return const Center(
+        child: SizedBox.square(
+          dimension: 24,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+      );
+    }
+
+    if (activeDocument == null) {
+      return EmptyEditorState(onOpenPressed: _pickFile);
+    }
+
+    if (_isLoading &&
+        activeDocument.markdown.isEmpty &&
+        activeDocument.errorMessage == null) {
+      return const Center(
+        child: SizedBox.square(
+          dimension: 24,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+      );
+    }
+
+    if (activeDocument.errorMessage != null &&
+        activeDocument.markdown.isEmpty) {
+      return ErrorState(
+        message: activeDocument.errorMessage!,
+        onOpenPressed: _pickFile,
+      );
+    }
+
+    final previewPane = PreviewPane(
+      markdown: activeDocument.markdown,
+      imageDirectory: _imageDirectoryForFile(activeDocument.filePath),
+      onTapLink:
+          (href) => _openMarkdownLinkForFile(activeDocument.filePath, href),
+    );
+
+    if (activeTab.viewMode == MarkdownViewMode.preview) {
+      return previewPane;
+    }
+
+    return SourcePane(
+      filePath: activeDocument.filePath,
+      markdown: activeDocument.markdown,
+      onChanged: _updateDocumentMarkdown,
+    );
+  }
+}
+
+class NativeFileOpenBridge {
+  static const MethodChannel _channel = MethodChannel('md_desktop/file_open');
+
+  static Future<void> attach({
+    required void Function(List<String> paths) onOpenFiles,
+  }) async {
+    if (!Platform.isMacOS) {
+      return;
+    }
+
+    _channel.setMethodCallHandler((call) async {
+      if (call.method != 'openFiles') {
+        return null;
+      }
+
+      final paths = _pathsFromArguments(call.arguments);
+      if (paths.isNotEmpty) {
+        onOpenFiles(paths);
+      }
+
+      return null;
+    });
+
+    try {
+      final pendingPaths = await _channel.invokeListMethod<String>(
+        'consumePendingFilePaths',
+      );
+
+      if (pendingPaths != null && pendingPaths.isNotEmpty) {
+        onOpenFiles(pendingPaths);
+      }
+    } on MissingPluginException {
+      // The bridge exists only on macOS.
+    }
+  }
+
+  static List<String> _pathsFromArguments(Object? arguments) {
+    if (arguments is String) {
+      return [arguments];
+    }
+
+    if (arguments is List) {
+      return arguments.whereType<String>().toList(growable: false);
+    }
+
+    return const [];
+  }
+}
+
+class EditorWindowBar extends StatelessWidget {
+  const EditorWindowBar({
+    super.key,
+    required this.fileName,
+    required this.onOpenPressed,
+    required this.onSavePressed,
+    required this.onReloadPressed,
+    required this.activeViewMode,
+    required this.onToggleViewMode,
+  });
+
+  final String fileName;
+  final VoidCallback onOpenPressed;
+  final VoidCallback? onSavePressed;
+  final VoidCallback? onReloadPressed;
+  final MarkdownViewMode activeViewMode;
+  final VoidCallback? onToggleViewMode;
+
+  @override
+  Widget build(BuildContext context) {
+    return DragToMoveArea(
+      child: Container(
+        height: 48,
+        padding: const EdgeInsets.only(left: 78, right: 10),
+        decoration: const BoxDecoration(
+          color: EditorColors.titleBar,
+          border: Border(
+            bottom: BorderSide(color: EditorColors.border, width: 1),
+          ),
+        ),
+        child: Row(
+          children: [
+            const Icon(
+              Icons.description_outlined,
+              size: 16,
+              color: EditorColors.mutedText,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                fileName,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: EditorColors.primaryText,
+                  fontWeight: FontWeight.w600,
+                  fontSize: 13,
+                ),
+              ),
+            ),
+            EditorToolbarButton(
+              tooltip: 'Open Markdown File',
+              icon: Icons.folder_open_outlined,
+              onPressed: onOpenPressed,
+            ),
+            EditorToolbarButton(
+              tooltip: 'Save',
+              icon: Icons.save_outlined,
+              onPressed: onSavePressed,
+            ),
+            EditorToolbarButton(
+              tooltip: 'Reload',
+              icon: Icons.refresh,
+              onPressed: onReloadPressed,
+            ),
+            EditorToolbarButton(
+              tooltip:
+                  activeViewMode == MarkdownViewMode.source
+                      ? 'Open Preview Tab'
+                      : 'Open Source Tab',
+              icon:
+                  activeViewMode == MarkdownViewMode.source
+                      ? Icons.visibility_outlined
+                      : Icons.article_outlined,
+              onPressed: onToggleViewMode,
+              selected: activeViewMode == MarkdownViewMode.preview,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class EditorToolbarButton extends StatelessWidget {
+  const EditorToolbarButton({
+    super.key,
+    required this.tooltip,
+    required this.icon,
+    required this.onPressed,
+    this.selected = false,
+  });
+
+  final String tooltip;
+  final IconData icon;
+  final VoidCallback? onPressed;
+  final bool selected;
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      tooltip: tooltip,
+      onPressed: onPressed,
+      icon: Icon(icon, size: 18),
+      color: selected ? EditorColors.primaryText : EditorColors.secondaryText,
+      disabledColor: EditorColors.disabledText,
+      style: IconButton.styleFrom(
+        backgroundColor: selected ? EditorColors.selection : Colors.transparent,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+        fixedSize: const Size.square(34),
+        padding: EdgeInsets.zero,
+      ),
+    );
+  }
+}
+
+class ActivityRail extends StatelessWidget {
+  const ActivityRail({
+    super.key,
+    required this.isExplorerVisible,
+    required this.onExplorerPressed,
+  });
+
+  final bool isExplorerVisible;
+  final VoidCallback onExplorerPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 50,
+      color: EditorColors.activityRail,
+      child: Column(
+        children: [
+          const SizedBox(height: 12),
+          RailIcon(
+            icon: Icons.copy_all_outlined,
+            selected: isExplorerVisible,
+            tooltip: 'Explorer',
+            onPressed: onExplorerPressed,
+          ),
+          const Spacer(),
+          const RailIcon(
+            icon: Icons.settings_outlined,
+            selected: false,
+            tooltip: 'Settings',
+          ),
+          const SizedBox(height: 10),
+        ],
+      ),
+    );
+  }
+}
+
+class RailIcon extends StatelessWidget {
+  const RailIcon({
+    super.key,
+    required this.icon,
+    required this.selected,
+    required this.tooltip,
+    this.onPressed,
+  });
+
+  final IconData icon;
+  final bool selected;
+  final String tooltip;
+  final VoidCallback? onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: onPressed,
+          hoverColor: EditorColors.panelHeader,
+          child: Container(
+            width: 50,
+            height: 48,
+            decoration: BoxDecoration(
+              border: Border(
+                left: BorderSide(
+                  color: selected ? EditorColors.accent : Colors.transparent,
+                  width: 2,
+                ),
+              ),
+            ),
+            child: Icon(
+              icon,
+              color:
+                  selected ? EditorColors.primaryText : EditorColors.mutedText,
+              size: 22,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class ExplorerPane extends StatelessWidget {
+  const ExplorerPane({
+    super.key,
+    required this.documents,
+    required this.activeFilePath,
+    required this.onOpenPressed,
+    required this.onSelectDocument,
+    required this.onRemoveDocument,
+    required this.onReorderDocument,
+  });
+
+  final List<MarkdownDocument> documents;
+  final String? activeFilePath;
+  final VoidCallback onOpenPressed;
+  final ValueChanged<String> onSelectDocument;
+  final ValueChanged<String> onRemoveDocument;
+  final void Function(String filePath, int targetIndex) onReorderDocument;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: const BoxDecoration(color: EditorColors.sidebar),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 14, 16, 10),
+            child: Text(
+              'EXPLORER',
+              style: TextStyle(
+                color: EditorColors.secondaryText,
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 0,
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: TextButton.icon(
+              onPressed: onOpenPressed,
+              icon: const Icon(Icons.folder_open_outlined, size: 17),
+              label: const Text('Open File'),
+              style: TextButton.styleFrom(
+                foregroundColor: EditorColors.primaryText,
+                alignment: Alignment.centerLeft,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(4),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          if (documents.isNotEmpty) ...[
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 4, 16, 6),
+              child: Text(
+                'OPEN EDITORS',
+                style: TextStyle(
+                  color: EditorColors.secondaryText,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0,
+                ),
+              ),
+            ),
+            for (var index = 0; index < documents.length; index++)
+              ExplorerDocumentTile(
+                document: documents[index],
+                selected: documents[index].filePath == activeFilePath,
+                onTap: () => onSelectDocument(documents[index].filePath),
+                onRemove: () => onRemoveDocument(documents[index].filePath),
+                onAcceptDocument:
+                    (filePath) => onReorderDocument(filePath, index),
+              ),
+            ExplorerDocumentDropZone(
+              onAcceptDocument:
+                  (filePath) => onReorderDocument(filePath, documents.length),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class ExplorerDocumentTile extends StatelessWidget {
+  const ExplorerDocumentTile({
+    super.key,
+    required this.document,
+    required this.selected,
+    required this.onTap,
+    required this.onRemove,
+    required this.onAcceptDocument,
+  });
+
+  final MarkdownDocument document;
+  final bool selected;
+  final VoidCallback onTap;
+  final VoidCallback onRemove;
+  final ValueChanged<String> onAcceptDocument;
+
+  @override
+  Widget build(BuildContext context) {
+    final tile = Material(
+      color: selected ? EditorColors.selection : Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        hoverColor: EditorColors.panelHeader,
+        child: Container(
+          height: 30,
+          alignment: Alignment.centerLeft,
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.start,
+            children: [
+              Icon(
+                document.errorMessage != null
+                    ? Icons.error_outline
+                    : Icons.description_outlined,
+                size: 15,
+                color:
+                    document.errorMessage == null
+                        ? EditorColors.markdownIcon
+                        : EditorColors.error,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  document.fileName,
+                  textAlign: TextAlign.left,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color:
+                        selected
+                            ? EditorColors.primaryText
+                            : EditorColors.secondaryText,
+                    fontSize: 13,
+                  ),
+                ),
+              ),
+              IconButton(
+                tooltip: 'Remove from Open Editors',
+                onPressed: onRemove,
+                icon: const Icon(Icons.remove, size: 15),
+                color: EditorColors.danger,
+                style: IconButton.styleFrom(
+                  fixedSize: const Size.square(24),
+                  padding: EdgeInsets.zero,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    return DragTarget<String>(
+      onWillAcceptWithDetails: (details) => details.data != document.filePath,
+      onAcceptWithDetails: (details) => onAcceptDocument(details.data),
+      builder: (context, candidateData, rejectedData) {
+        final isHovering = candidateData.isNotEmpty;
+        final decoratedTile = DecoratedBox(
+          decoration: BoxDecoration(
+            border: Border(
+              top: BorderSide(
+                color: isHovering ? EditorColors.accent : Colors.transparent,
+                width: 2,
+              ),
+            ),
+          ),
+          child: tile,
+        );
+
+        return Draggable<String>(
+          data: document.filePath,
+          feedback: Material(
+            color: Colors.transparent,
+            child: Opacity(
+              opacity: 0.9,
+              child: SizedBox(width: 250, height: 30, child: tile),
+            ),
+          ),
+          childWhenDragging: Opacity(opacity: 0.42, child: decoratedTile),
+          child: MouseRegion(
+            cursor: SystemMouseCursors.grab,
+            child: decoratedTile,
+          ),
+        );
+      },
+    );
+  }
+}
+
+class ExplorerDocumentDropZone extends StatelessWidget {
+  const ExplorerDocumentDropZone({super.key, required this.onAcceptDocument});
+
+  final ValueChanged<String> onAcceptDocument;
+
+  @override
+  Widget build(BuildContext context) {
+    return DragTarget<String>(
+      onWillAcceptWithDetails: (_) => true,
+      onAcceptWithDetails: (details) => onAcceptDocument(details.data),
+      builder: (context, candidateData, rejectedData) {
+        final isHovering = candidateData.isNotEmpty;
+
+        return AnimatedContainer(
+          duration: const Duration(milliseconds: 100),
+          height: isHovering ? 18 : 6,
+          margin: const EdgeInsets.symmetric(horizontal: 16),
+          decoration: BoxDecoration(
+            border: Border(
+              top: BorderSide(
+                color: isHovering ? EditorColors.accent : Colors.transparent,
+                width: 2,
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class EditorTabBar extends StatelessWidget {
+  const EditorTabBar({
+    super.key,
+    required this.documents,
+    required this.tabs,
+    required this.activeTabIndex,
+    required this.groupId,
+    required this.onSelectTab,
+    required this.onCloseTab,
+    required this.onReorderTab,
+  });
+
+  final List<MarkdownDocument> documents;
+  final List<MarkdownEditorTab> tabs;
+  final int activeTabIndex;
+  final EditorGroupId groupId;
+  final ValueChanged<int> onSelectTab;
+  final ValueChanged<int> onCloseTab;
+  final void Function(EditorTabDragPayload payload, int targetIndex)
+  onReorderTab;
+
+  MarkdownDocument? _documentForTab(MarkdownEditorTab tab) {
+    for (final document in documents) {
+      if (document.filePath == tab.filePath) {
+        return document;
+      }
+    }
+
+    return null;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final tabWidgets = [
+      for (var index = 0; index < tabs.length; index++)
+        Builder(
+          builder: (context) {
+            final document = _documentForTab(tabs[index]);
+            if (document == null) {
+              return const SizedBox.shrink();
+            }
+
+            return DocumentTab(
+              document: document,
+              viewMode: tabs[index].viewMode,
+              selected: index == activeTabIndex,
+              dragPayload: EditorTabDragPayload(
+                groupId: groupId,
+                tabIndex: index,
+              ),
+              onSelect: () => onSelectTab(index),
+              onClose: () => onCloseTab(index),
+              onAcceptTab: (payload) => onReorderTab(payload, index),
+            );
+          },
+        ),
+      TabReorderDropZone(
+        onAcceptTab: (payload) => onReorderTab(payload, tabs.length),
+      ),
+    ];
+
+    return Container(
+      height: 36,
+      color: EditorColors.tabBar,
+      alignment: Alignment.centerLeft,
+      child:
+          tabs.isEmpty
+              ? const Row(children: [WelcomeTab(), Expanded(child: SizedBox())])
+              : ListView(
+                scrollDirection: Axis.horizontal,
+                children: tabWidgets,
+              ),
+    );
+  }
+}
+
+class TabReorderDropZone extends StatelessWidget {
+  const TabReorderDropZone({super.key, required this.onAcceptTab});
+
+  final ValueChanged<EditorTabDragPayload> onAcceptTab;
+
+  @override
+  Widget build(BuildContext context) {
+    return DragTarget<EditorTabDragPayload>(
+      onWillAcceptWithDetails: (_) => true,
+      onAcceptWithDetails: (details) => onAcceptTab(details.data),
+      builder: (context, candidateData, rejectedData) {
+        final isHovering = candidateData.isNotEmpty;
+
+        return AnimatedContainer(
+          duration: const Duration(milliseconds: 100),
+          width: isHovering ? 44 : 24,
+          height: 36,
+          decoration: BoxDecoration(
+            border: Border(
+              left: BorderSide(
+                color: isHovering ? EditorColors.accent : Colors.transparent,
+                width: 2,
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class WelcomeTab extends StatelessWidget {
+  const WelcomeTab({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 180,
+      height: 36,
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      decoration: const BoxDecoration(
+        color: EditorColors.editor,
+        border: Border(right: BorderSide(color: EditorColors.border, width: 1)),
+      ),
+      child: const Row(
+        children: [
+          Icon(Icons.home_outlined, size: 15, color: EditorColors.mutedText),
+          SizedBox(width: 8),
+          Text(
+            'Welcome',
+            style: TextStyle(color: EditorColors.primaryText, fontSize: 13),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class DocumentTab extends StatelessWidget {
+  const DocumentTab({
+    super.key,
+    required this.document,
+    required this.viewMode,
+    required this.selected,
+    required this.dragPayload,
+    required this.onSelect,
+    required this.onClose,
+    required this.onAcceptTab,
+  });
+
+  final MarkdownDocument document;
+  final MarkdownViewMode viewMode;
+  final bool selected;
+  final EditorTabDragPayload dragPayload;
+  final VoidCallback onSelect;
+  final VoidCallback onClose;
+  final ValueChanged<EditorTabDragPayload> onAcceptTab;
+
+  @override
+  Widget build(BuildContext context) {
+    final tab = Material(
+      color: selected ? EditorColors.editor : EditorColors.tabBar,
+      child: InkWell(
+        onTap: onSelect,
+        hoverColor: EditorColors.panelHeader,
+        child: Container(
+          width: viewMode == MarkdownViewMode.source ? 190 : 230,
+          height: 36,
+          padding: const EdgeInsets.only(left: 12, right: 4),
+          decoration: const BoxDecoration(
+            border: Border(
+              right: BorderSide(color: EditorColors.border, width: 1),
+            ),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                document.errorMessage != null
+                    ? Icons.error_outline
+                    : viewMode == MarkdownViewMode.source
+                    ? Icons.description_outlined
+                    : Icons.visibility_outlined,
+                size: 15,
+                color:
+                    document.errorMessage == null
+                        ? EditorColors.markdownIcon
+                        : EditorColors.error,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  viewMode == MarkdownViewMode.source
+                      ? document.fileName
+                      : 'Preview ${document.fileName}',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color:
+                        selected
+                            ? EditorColors.primaryText
+                            : EditorColors.secondaryText,
+                    fontSize: 13,
+                    fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                  ),
+                ),
+              ),
+              IconButton(
+                tooltip: 'Close',
+                onPressed: onClose,
+                icon: const Icon(Icons.close, size: 15),
+                color:
+                    selected
+                        ? EditorColors.secondaryText
+                        : EditorColors.mutedText,
+                style: IconButton.styleFrom(
+                  fixedSize: const Size.square(28),
+                  padding: EdgeInsets.zero,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    return DragTarget<EditorTabDragPayload>(
+      onWillAcceptWithDetails: (details) {
+        final payload = details.data;
+        return payload.groupId != dragPayload.groupId ||
+            payload.tabIndex != dragPayload.tabIndex;
+      },
+      onAcceptWithDetails: (details) => onAcceptTab(details.data),
+      builder: (context, candidateData, rejectedData) {
+        final isHovering = candidateData.isNotEmpty;
+        final decoratedTab = DecoratedBox(
+          decoration: BoxDecoration(
+            border: Border(
+              left: BorderSide(
+                color: isHovering ? EditorColors.accent : Colors.transparent,
+                width: 2,
+              ),
+            ),
+          ),
+          child: tab,
+        );
+
+        return Draggable<EditorTabDragPayload>(
+          data: dragPayload,
+          feedback: Material(
+            color: Colors.transparent,
+            child: Opacity(
+              opacity: 0.88,
+              child: SizedBox(
+                width: viewMode == MarkdownViewMode.source ? 190 : 230,
+                height: 36,
+                child: tab,
+              ),
+            ),
+          ),
+          childWhenDragging: Opacity(opacity: 0.45, child: decoratedTab),
+          child: decoratedTab,
+        );
+      },
+    );
+  }
+}
+
+class SplitResizeDivider extends StatefulWidget {
+  const SplitResizeDivider({
+    super.key,
+    required this.onDragDelta,
+    required this.onReset,
+  });
+
+  static const double width = 9;
+
+  final ValueChanged<double> onDragDelta;
+  final VoidCallback onReset;
+
+  @override
+  State<SplitResizeDivider> createState() => _SplitResizeDividerState();
+}
+
+class _SplitResizeDividerState extends State<SplitResizeDivider> {
+  bool _isHovered = false;
+  bool _isDragging = false;
+
+  bool get _isActive => _isHovered || _isDragging;
+
+  @override
+  Widget build(BuildContext context) {
+    final dividerColor = _isActive ? EditorColors.accent : EditorColors.border;
+
+    return MouseRegion(
+      cursor: SystemMouseCursors.resizeColumn,
+      onEnter: (_) {
+        setState(() {
+          _isHovered = true;
+        });
+      },
+      onExit: (_) {
+        setState(() {
+          _isHovered = false;
+        });
+      },
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onDoubleTap: widget.onReset,
+        onHorizontalDragStart: (_) {
+          setState(() {
+            _isDragging = true;
+          });
+        },
+        onHorizontalDragUpdate:
+            (details) => widget.onDragDelta(details.delta.dx),
+        onHorizontalDragEnd: (_) {
+          setState(() {
+            _isDragging = false;
+          });
+        },
+        onHorizontalDragCancel: () {
+          setState(() {
+            _isDragging = false;
+          });
+        },
+        child: SizedBox(
+          width: SplitResizeDivider.width,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color:
+                  _isActive
+                      ? EditorColors.accent.withValues(alpha: 0.12)
+                      : Colors.transparent,
+              border: Border(
+                left: BorderSide(color: dividerColor, width: _isActive ? 2 : 1),
+              ),
+            ),
+            child: const SizedBox.expand(),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class SplitPreviewOverlay extends StatelessWidget {
+  const SplitPreviewOverlay({super.key, required this.side});
+
+  final SplitDropSide side;
+
+  @override
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+      child: Row(
+        children:
+            side == SplitDropSide.left
+                ? [_highlightedPane(), _dimmedPane()]
+                : [_dimmedPane(), _highlightedPane()],
+      ),
+    );
+  }
+
+  Widget _dimmedPane() {
+    return Expanded(
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: EditorColors.background.withValues(alpha: 0.56),
+        ),
+      ),
+    );
+  }
+
+  Widget _highlightedPane() {
+    return Expanded(
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 120),
+        decoration: BoxDecoration(
+          color: EditorColors.selection.withValues(alpha: 0.68),
+          border: Border.all(color: EditorColors.accent, width: 2),
+        ),
+        child: const Center(
+          child: Icon(
+            Icons.vertical_split_outlined,
+            color: EditorColors.primaryText,
+            size: 32,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class SourcePane extends StatelessWidget {
+  const SourcePane({
+    super.key,
+    required this.filePath,
+    required this.markdown,
+    required this.onChanged,
+  });
+
+  final String filePath;
+  final String markdown;
+  final void Function(String filePath, String markdown) onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        const PanelHeader(title: 'SOURCE'),
+        Expanded(
+          child: MarkdownSourceEditor(
+            filePath: filePath,
+            markdown: markdown,
+            onChanged: onChanged,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class MarkdownSourceEditor extends StatefulWidget {
+  const MarkdownSourceEditor({
+    super.key,
+    required this.filePath,
+    required this.markdown,
+    required this.onChanged,
+  });
+
+  final String filePath;
+  final String markdown;
+  final void Function(String filePath, String markdown) onChanged;
+
+  @override
+  State<MarkdownSourceEditor> createState() => _MarkdownSourceEditorState();
+}
+
+class _MarkdownSourceEditorState extends State<MarkdownSourceEditor> {
+  late final TextEditingController _textController;
+  late final ScrollController _scrollController;
+
+  @override
+  void initState() {
+    super.initState();
+    _textController = TextEditingController(text: widget.markdown);
+    _scrollController = ScrollController();
+  }
+
+  @override
+  void didUpdateWidget(covariant MarkdownSourceEditor oldWidget) {
+    super.didUpdateWidget(oldWidget);
+
+    if (widget.markdown != _textController.text) {
+      final oldSelection = _textController.selection;
+      final selectionOffset = oldSelection.baseOffset.clamp(
+        0,
+        widget.markdown.length,
+      );
+
+      _textController.value = TextEditingValue(
+        text: widget.markdown,
+        selection: TextSelection.collapsed(offset: selectionOffset),
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    _textController.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final lineCount =
+        _textController.text.isEmpty
+            ? 1
+            : '\n'.allMatches(_textController.text).length + 1;
+
+    return DecoratedBox(
+      decoration: const BoxDecoration(color: EditorColors.editor),
+      child: Scrollbar(
+        controller: _scrollController,
+        thumbVisibility: true,
+        child: SingleChildScrollView(
+          controller: _scrollController,
+          padding: const EdgeInsets.fromLTRB(0, 18, 24, 24),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              SizedBox(
+                width: 62,
+                child: Padding(
+                  padding: const EdgeInsets.only(right: 12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      for (var line = 1; line <= lineCount; line++)
+                        Text(
+                          '$line',
+                          textAlign: TextAlign.right,
+                          style: const TextStyle(
+                            color: EditorColors.lineNumber,
+                            fontFamily: 'Menlo',
+                            fontSize: 13,
+                            height: 1.55,
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+              Expanded(
+                child: TextField(
+                  controller: _textController,
+                  autofocus: true,
+                  minLines: null,
+                  maxLines: null,
+                  keyboardType: TextInputType.multiline,
+                  cursorColor: EditorColors.accent,
+                  style: const TextStyle(
+                    color: EditorColors.primaryText,
+                    fontFamily: 'Menlo',
+                    fontSize: 13,
+                    height: 1.55,
+                  ),
+                  decoration: const InputDecoration(
+                    border: InputBorder.none,
+                    isCollapsed: true,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  onChanged:
+                      (value) => widget.onChanged(widget.filePath, value),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class PreviewPane extends StatelessWidget {
+  const PreviewPane({
+    super.key,
+    required this.markdown,
+    required this.imageDirectory,
+    required this.onTapLink,
+  });
+
+  final String markdown;
+  final String? imageDirectory;
+  final Future<void> Function(String? href) onTapLink;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        const PanelHeader(title: 'PREVIEW'),
+        Expanded(
+          child: DecoratedBox(
+            decoration: const BoxDecoration(color: EditorColors.preview),
+            child: Markdown(
+              selectable: true,
+              data: markdown,
+              imageDirectory: imageDirectory,
+              onTapLink: (_, href, __) => onTapLink(href),
+              padding: const EdgeInsets.fromLTRB(52, 28, 52, 52),
+              styleSheet: markdownStyleSheet,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class PanelHeader extends StatelessWidget {
+  const PanelHeader({super.key, required this.title});
+
+  final String title;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 34,
+      padding: const EdgeInsets.symmetric(horizontal: 14),
+      alignment: Alignment.centerLeft,
+      decoration: const BoxDecoration(
+        color: EditorColors.panelHeader,
+        border: Border(
+          bottom: BorderSide(color: EditorColors.border, width: 1),
+        ),
+      ),
+      child: Text(
+        title,
+        style: const TextStyle(
+          color: EditorColors.secondaryText,
+          fontSize: 11,
+          fontWeight: FontWeight.w700,
+          letterSpacing: 0,
+        ),
+      ),
+    );
+  }
+}
+
+class EmptyEditorState extends StatelessWidget {
+  const EmptyEditorState({super.key, required this.onOpenPressed});
+
+  final VoidCallback onOpenPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(
+            Icons.description_outlined,
+            size: 46,
+            color: EditorColors.mutedText,
+          ),
+          const SizedBox(height: 18),
+          FilledButton.icon(
+            onPressed: onOpenPressed,
+            icon: const Icon(Icons.folder_open_outlined),
+            label: const Text('Open Markdown File'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class ErrorState extends StatelessWidget {
+  const ErrorState({
+    super.key,
+    required this.message,
+    required this.onOpenPressed,
+  });
+
+  final String message;
+  final VoidCallback onOpenPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 540),
+        child: Padding(
+          padding: const EdgeInsets.all(28),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.error_outline,
+                size: 38,
+                color: EditorColors.error,
+              ),
+              const SizedBox(height: 14),
+              SelectableText(
+                message,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: EditorColors.primaryText,
+                  fontSize: 13,
+                  height: 1.45,
+                ),
+              ),
+              const SizedBox(height: 18),
+              OutlinedButton.icon(
+                onPressed: onOpenPressed,
+                icon: const Icon(Icons.folder_open_outlined),
+                label: const Text('Open Another File'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class StatusBar extends StatelessWidget {
+  const StatusBar({
+    super.key,
+    required this.filePath,
+    required this.lineCount,
+    required this.wordCount,
+    required this.lastModified,
+    required this.autoReload,
+    required this.onAutoReloadChanged,
+  });
+
+  final String? filePath;
+  final int lineCount;
+  final int wordCount;
+  final DateTime? lastModified;
+  final bool autoReload;
+  final ValueChanged<bool> onAutoReloadChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 24,
+      padding: const EdgeInsets.symmetric(horizontal: 10),
+      color: EditorColors.accent,
+      child: Row(
+        children: [
+          const Icon(Icons.check, size: 14, color: Colors.white),
+          const SizedBox(width: 8),
+          Text(
+            filePath == null ? 'Ready' : p.basename(filePath!),
+            style: const TextStyle(color: Colors.white, fontSize: 12),
+          ),
+          const Spacer(),
+          Text(
+            '$lineCount lines',
+            style: const TextStyle(color: Colors.white, fontSize: 12),
+          ),
+          const SizedBox(width: 16),
+          Text(
+            '$wordCount words',
+            style: const TextStyle(color: Colors.white, fontSize: 12),
+          ),
+          const SizedBox(width: 16),
+          if (lastModified != null)
+            Text(
+              'Modified ${_formatTime(lastModified!)}',
+              style: const TextStyle(color: Colors.white, fontSize: 12),
+            ),
+          const SizedBox(width: 16),
+          Row(
+            children: [
+              const Text(
+                'Auto reload',
+                style: TextStyle(color: Colors.white, fontSize: 12),
+              ),
+              Transform.scale(
+                scale: 0.75,
+                child: Switch(
+                  value: autoReload,
+                  activeColor: Colors.white,
+                  activeTrackColor: Colors.white38,
+                  inactiveThumbColor: Colors.white70,
+                  inactiveTrackColor: Colors.black26,
+                  onChanged: onAutoReloadChanged,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  static String _formatTime(DateTime value) {
+    final hour = value.hour.toString().padLeft(2, '0');
+    final minute = value.minute.toString().padLeft(2, '0');
+    return '$hour:$minute';
+  }
+}
+
+bool _isMarkdownPath(String path) {
+  final extension = p.extension(path).replaceFirst('.', '').toLowerCase();
+  return const {'md', 'markdown', 'mdown', 'mkd', 'txt'}.contains(extension);
+}
+
+final MarkdownStyleSheet markdownStyleSheet = MarkdownStyleSheet(
+  p: const TextStyle(
+    color: EditorColors.primaryText,
+    fontSize: 15,
+    height: 1.55,
+  ),
+  a: const TextStyle(
+    color: EditorColors.link,
+    fontSize: 15,
+    height: 1.55,
+    decoration: TextDecoration.underline,
+    decorationColor: EditorColors.link,
+  ),
+  h1: const TextStyle(
+    color: EditorColors.primaryText,
+    fontSize: 30,
+    height: 1.25,
+    fontWeight: FontWeight.w800,
+  ),
+  h1Padding: const EdgeInsets.only(top: 8, bottom: 12),
+  h2: const TextStyle(
+    color: EditorColors.primaryText,
+    fontSize: 22,
+    height: 1.35,
+    fontWeight: FontWeight.w700,
+  ),
+  h2Padding: const EdgeInsets.only(top: 20, bottom: 8),
+  h3: const TextStyle(
+    color: EditorColors.primaryText,
+    fontSize: 18,
+    height: 1.4,
+    fontWeight: FontWeight.w700,
+  ),
+  h3Padding: const EdgeInsets.only(top: 16, bottom: 6),
+  h4: const TextStyle(
+    color: EditorColors.primaryText,
+    fontSize: 16,
+    height: 1.45,
+    fontWeight: FontWeight.w700,
+  ),
+  h5: const TextStyle(
+    color: EditorColors.primaryText,
+    fontSize: 15,
+    height: 1.45,
+    fontWeight: FontWeight.w700,
+  ),
+  h6: const TextStyle(
+    color: EditorColors.secondaryText,
+    fontSize: 14,
+    height: 1.45,
+    fontWeight: FontWeight.w700,
+  ),
+  strong: const TextStyle(fontWeight: FontWeight.w800),
+  em: const TextStyle(fontStyle: FontStyle.italic),
+  code: const TextStyle(
+    color: EditorColors.codeText,
+    backgroundColor: EditorColors.inlineCodeBackground,
+    fontFamily: 'Menlo',
+    fontSize: 13,
+    height: 1.45,
+  ),
+  codeblockPadding: const EdgeInsets.all(14),
+  codeblockDecoration: BoxDecoration(
+    color: EditorColors.codeBlockBackground,
+    borderRadius: BorderRadius.circular(4),
+    border: Border.all(color: EditorColors.border),
+  ),
+  blockquote: const TextStyle(
+    color: EditorColors.secondaryText,
+    fontSize: 15,
+    height: 1.55,
+  ),
+  blockquotePadding: const EdgeInsets.fromLTRB(16, 10, 14, 10),
+  blockquoteDecoration: const BoxDecoration(
+    color: EditorColors.panelHeader,
+    border: Border(left: BorderSide(color: EditorColors.accent, width: 3)),
+  ),
+  tableHead: const TextStyle(
+    color: EditorColors.primaryText,
+    fontWeight: FontWeight.w700,
+  ),
+  tableBody: const TextStyle(
+    color: EditorColors.primaryText,
+    fontSize: 14,
+    height: 1.45,
+  ),
+  tableBorder: TableBorder.all(color: EditorColors.border),
+  tableCellsPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+  listBullet: const TextStyle(color: EditorColors.primaryText, fontSize: 15),
+  horizontalRuleDecoration: const BoxDecoration(
+    border: Border(top: BorderSide(color: EditorColors.border, width: 1)),
+  ),
+);
+
+class EditorColors {
+  static const Color background = Color(0xFF1E1E1E);
+  static const Color titleBar = Color(0xFF2D2D2D);
+  static const Color activityRail = Color(0xFF333333);
+  static const Color sidebar = Color(0xFF252526);
+  static const Color tabBar = Color(0xFF2D2D2D);
+  static const Color editor = Color(0xFF1E1E1E);
+  static const Color preview = Color(0xFF1F1F1F);
+  static const Color panelHeader = Color(0xFF242424);
+  static const Color border = Color(0xFF3C3C3C);
+  static const Color selection = Color(0xFF37373D);
+  static const Color accent = Color(0xFF007ACC);
+  static const Color primaryText = Color(0xFFD4D4D4);
+  static const Color secondaryText = Color(0xFFBDBDBD);
+  static const Color mutedText = Color(0xFF858585);
+  static const Color disabledText = Color(0xFF5F5F5F);
+  static const Color lineNumber = Color(0xFF6E7681);
+  static const Color markdownIcon = Color(0xFFD7BA7D);
+  static const Color codeText = Color(0xFFDCDCAA);
+  static const Color inlineCodeBackground = Color(0xFF3A3324);
+  static const Color codeBlockBackground = Color(0xFF252526);
+  static const Color link = Color(0xFF4FC1FF);
+  static const Color error = Color(0xFFF48771);
+  static const Color danger = Color(0xFFFF5F57);
+}
