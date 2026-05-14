@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:path/path.dart' as p;
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:watcher/watcher.dart';
 import 'package:window_manager/window_manager.dart';
@@ -23,7 +24,7 @@ Future<void> main() async {
       title: 'MD Preview',
       titleBarStyle: TitleBarStyle.hidden,
       windowButtonVisibility: true,
-      backgroundColor: EditorColors.background,
+      backgroundColor: Color(0xFF1E1E1E),
     );
 
     windowManager.waitUntilReadyToShow(windowOptions, () async {
@@ -35,32 +36,78 @@ Future<void> main() async {
   runApp(const MdPreviewApp());
 }
 
-class MdPreviewApp extends StatelessWidget {
+class MdPreviewApp extends StatefulWidget {
   const MdPreviewApp({super.key});
+
+  @override
+  State<MdPreviewApp> createState() => _MdPreviewAppState();
+}
+
+class _MdPreviewAppState extends State<MdPreviewApp> {
+  static const _themePreferenceKey = 'theme_mode';
+
+  ThemeMode _themeMode = ThemeMode.dark;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadThemeMode());
+  }
+
+  Future<void> _loadThemeMode() async {
+    final preferences = await SharedPreferences.getInstance();
+    final savedMode = preferences.getString(_themePreferenceKey);
+    final themeMode = savedMode == 'light' ? ThemeMode.light : ThemeMode.dark;
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _themeMode = themeMode;
+    });
+  }
+
+  Future<void> _toggleThemeMode() async {
+    final nextMode =
+        _themeMode == ThemeMode.dark ? ThemeMode.light : ThemeMode.dark;
+
+    setState(() {
+      _themeMode = nextMode;
+    });
+
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.setString(
+      _themePreferenceKey,
+      nextMode == ThemeMode.light ? 'light' : 'dark',
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'MD Preview',
-      theme: ThemeData(
-        brightness: Brightness.dark,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: EditorColors.accent,
-          brightness: Brightness.dark,
-          surface: EditorColors.background,
-        ),
-        fontFamily: 'SF Pro Text',
-        scaffoldBackgroundColor: EditorColors.background,
-        useMaterial3: true,
+      theme: _buildAppTheme(EditorThemeColors.lightMode, Brightness.light),
+      darkTheme: _buildAppTheme(EditorThemeColors.darkMode, Brightness.dark),
+      themeMode: _themeMode,
+      home: MarkdownStudioPage(
+        currentThemeMode: _themeMode,
+        onToggleThemeMode: _toggleThemeMode,
       ),
-      home: const MarkdownStudioPage(),
     );
   }
 }
 
 class MarkdownStudioPage extends StatefulWidget {
-  const MarkdownStudioPage({super.key});
+  const MarkdownStudioPage({
+    super.key,
+    required this.currentThemeMode,
+    required this.onToggleThemeMode,
+  });
+
+  final ThemeMode currentThemeMode;
+  final VoidCallback onToggleThemeMode;
 
   @override
   State<MarkdownStudioPage> createState() => _MarkdownStudioPageState();
@@ -344,16 +391,6 @@ class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
         _isLoading = false;
       });
     }
-  }
-
-  Future<void> _saveActiveFile() async {
-    final activeDocument = _activeDocument;
-    if (activeDocument == null) {
-      return;
-    }
-
-    _cancelAutoSave(activeDocument.filePath);
-    await _saveDocument(activeDocument.filePath);
   }
 
   Future<void> _saveDocument(String filePath) async {
@@ -976,23 +1013,24 @@ class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.editorColors;
     final singleVisibleGroup = _singleVisibleEditorGroup;
 
     return Scaffold(
       body: ColoredBox(
-        color: EditorColors.background,
+        color: colors.background,
         child: Column(
           children: [
             EditorWindowBar(
               fileName: _fileName,
               onOpenPressed: _pickFile,
-              onSavePressed:
-                  _activeDocument?.isDirty == true ? _saveActiveFile : null,
               onReloadPressed:
                   _filePath == null ? null : () => _reloadCurrentFile(),
               activeViewMode: _activeViewMode,
               onToggleViewMode:
                   _filePath == null ? null : _activateOrOpenSiblingTab,
+              currentThemeMode: widget.currentThemeMode,
+              onToggleThemeMode: widget.onToggleThemeMode,
             ),
             Expanded(
               child: Row(
@@ -1227,12 +1265,12 @@ class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
                 (details) => _moveTabToGroup(details.data, groupId),
             builder: (context, candidateData, rejectedData) {
               final isHovering = candidateData.isNotEmpty;
+              final colors = context.editorColors;
 
               return DecoratedBox(
                 decoration: BoxDecoration(
                   border: Border.all(
-                    color:
-                        isHovering ? EditorColors.accent : Colors.transparent,
+                    color: isHovering ? colors.accent : Colors.transparent,
                     width: 2,
                   ),
                 ),
@@ -1361,46 +1399,44 @@ class EditorWindowBar extends StatelessWidget {
     super.key,
     required this.fileName,
     required this.onOpenPressed,
-    required this.onSavePressed,
     required this.onReloadPressed,
     required this.activeViewMode,
     required this.onToggleViewMode,
+    required this.currentThemeMode,
+    required this.onToggleThemeMode,
   });
 
   final String fileName;
   final VoidCallback onOpenPressed;
-  final VoidCallback? onSavePressed;
   final VoidCallback? onReloadPressed;
   final MarkdownViewMode activeViewMode;
   final VoidCallback? onToggleViewMode;
+  final ThemeMode currentThemeMode;
+  final VoidCallback onToggleThemeMode;
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.editorColors;
+
     return DragToMoveArea(
       child: Container(
         height: 48,
         padding: const EdgeInsets.only(left: 78, right: 10),
-        decoration: const BoxDecoration(
-          color: EditorColors.titleBar,
-          border: Border(
-            bottom: BorderSide(color: EditorColors.border, width: 1),
-          ),
+        decoration: BoxDecoration(
+          color: colors.titleBar,
+          border: Border(bottom: BorderSide(color: colors.border, width: 1)),
         ),
         child: Row(
           children: [
-            const Icon(
-              Icons.description_outlined,
-              size: 16,
-              color: EditorColors.mutedText,
-            ),
+            Icon(Icons.description_outlined, size: 16, color: colors.mutedText),
             const SizedBox(width: 8),
             Expanded(
               child: Text(
                 fileName,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  color: EditorColors.primaryText,
+                style: TextStyle(
+                  color: colors.primaryText,
                   fontWeight: FontWeight.w600,
                   fontSize: 13,
                 ),
@@ -1412,14 +1448,20 @@ class EditorWindowBar extends StatelessWidget {
               onPressed: onOpenPressed,
             ),
             EditorToolbarButton(
-              tooltip: 'Save',
-              icon: Icons.save_outlined,
-              onPressed: onSavePressed,
-            ),
-            EditorToolbarButton(
               tooltip: 'Reload',
               icon: Icons.refresh,
               onPressed: onReloadPressed,
+            ),
+            EditorToolbarButton(
+              tooltip:
+                  currentThemeMode == ThemeMode.dark
+                      ? 'Switch to Light Mode'
+                      : 'Switch to Dark Mode',
+              icon:
+                  currentThemeMode == ThemeMode.dark
+                      ? Icons.light_mode_outlined
+                      : Icons.dark_mode_outlined,
+              onPressed: onToggleThemeMode,
             ),
             EditorToolbarButton(
               tooltip:
@@ -1456,14 +1498,16 @@ class EditorToolbarButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.editorColors;
+
     return IconButton(
       tooltip: tooltip,
       onPressed: onPressed,
       icon: Icon(icon, size: 18),
-      color: selected ? EditorColors.primaryText : EditorColors.secondaryText,
-      disabledColor: EditorColors.disabledText,
+      color: selected ? colors.primaryText : colors.secondaryText,
+      disabledColor: colors.disabledText,
       style: IconButton.styleFrom(
-        backgroundColor: selected ? EditorColors.selection : Colors.transparent,
+        backgroundColor: selected ? colors.selection : Colors.transparent,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
         fixedSize: const Size.square(34),
         padding: EdgeInsets.zero,
@@ -1484,9 +1528,11 @@ class ActivityRail extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.editorColors;
+
     return Container(
       width: 50,
-      color: EditorColors.activityRail,
+      color: colors.activityRail,
       child: Column(
         children: [
           const SizedBox(height: 12),
@@ -1525,28 +1571,29 @@ class RailIcon extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.editorColors;
+
     return Tooltip(
       message: tooltip,
       child: Material(
         color: Colors.transparent,
         child: InkWell(
           onTap: onPressed,
-          hoverColor: EditorColors.panelHeader,
+          hoverColor: colors.panelHeader,
           child: Container(
             width: 50,
             height: 48,
             decoration: BoxDecoration(
               border: Border(
                 left: BorderSide(
-                  color: selected ? EditorColors.accent : Colors.transparent,
+                  color: selected ? colors.accent : Colors.transparent,
                   width: 2,
                 ),
               ),
             ),
             child: Icon(
               icon,
-              color:
-                  selected ? EditorColors.primaryText : EditorColors.mutedText,
+              color: selected ? colors.primaryText : colors.mutedText,
               size: 22,
             ),
           ),
@@ -1576,17 +1623,19 @@ class ExplorerPane extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.editorColors;
+
     return Container(
-      decoration: const BoxDecoration(color: EditorColors.sidebar),
+      decoration: BoxDecoration(color: colors.sidebar),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          const Padding(
+          Padding(
             padding: EdgeInsets.fromLTRB(16, 14, 16, 10),
             child: Text(
               'EXPLORER',
               style: TextStyle(
-                color: EditorColors.secondaryText,
+                color: colors.secondaryText,
                 fontSize: 11,
                 fontWeight: FontWeight.w600,
                 letterSpacing: 0,
@@ -1600,7 +1649,7 @@ class ExplorerPane extends StatelessWidget {
               icon: const Icon(Icons.folder_open_outlined, size: 17),
               label: const Text('Open File'),
               style: TextButton.styleFrom(
-                foregroundColor: EditorColors.primaryText,
+                foregroundColor: colors.primaryText,
                 alignment: Alignment.centerLeft,
                 shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(4),
@@ -1610,12 +1659,12 @@ class ExplorerPane extends StatelessWidget {
           ),
           const SizedBox(height: 10),
           if (documents.isNotEmpty) ...[
-            const Padding(
+            Padding(
               padding: EdgeInsets.fromLTRB(16, 4, 16, 6),
               child: Text(
                 'OPEN EDITORS',
                 style: TextStyle(
-                  color: EditorColors.secondaryText,
+                  color: colors.secondaryText,
                   fontSize: 11,
                   fontWeight: FontWeight.w700,
                   letterSpacing: 0,
@@ -1660,11 +1709,13 @@ class ExplorerDocumentTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.editorColors;
+
     final tile = Material(
-      color: selected ? EditorColors.selection : Colors.transparent,
+      color: selected ? colors.selection : Colors.transparent,
       child: InkWell(
         onTap: onTap,
-        hoverColor: EditorColors.panelHeader,
+        hoverColor: colors.panelHeader,
         child: Container(
           height: 30,
           alignment: Alignment.centerLeft,
@@ -1679,8 +1730,8 @@ class ExplorerDocumentTile extends StatelessWidget {
                 size: 15,
                 color:
                     document.errorMessage == null
-                        ? EditorColors.markdownIcon
-                        : EditorColors.error,
+                        ? colors.markdownIcon
+                        : colors.error,
               ),
               const SizedBox(width: 8),
               Expanded(
@@ -1690,10 +1741,7 @@ class ExplorerDocumentTile extends StatelessWidget {
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
-                    color:
-                        selected
-                            ? EditorColors.primaryText
-                            : EditorColors.secondaryText,
+                    color: selected ? colors.primaryText : colors.secondaryText,
                     fontSize: 13,
                   ),
                 ),
@@ -1702,7 +1750,7 @@ class ExplorerDocumentTile extends StatelessWidget {
                 tooltip: 'Remove from Open Editors',
                 onPressed: onRemove,
                 icon: const Icon(Icons.remove, size: 15),
-                color: EditorColors.danger,
+                color: colors.danger,
                 style: IconButton.styleFrom(
                   fixedSize: const Size.square(24),
                   padding: EdgeInsets.zero,
@@ -1726,7 +1774,7 @@ class ExplorerDocumentTile extends StatelessWidget {
           decoration: BoxDecoration(
             border: Border(
               top: BorderSide(
-                color: isHovering ? EditorColors.accent : Colors.transparent,
+                color: isHovering ? colors.accent : Colors.transparent,
                 width: 2,
               ),
             ),
@@ -1761,6 +1809,8 @@ class ExplorerDocumentDropZone extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.editorColors;
+
     return DragTarget<String>(
       onWillAcceptWithDetails: (_) => true,
       onAcceptWithDetails: (details) => onAcceptDocument(details.data),
@@ -1774,7 +1824,7 @@ class ExplorerDocumentDropZone extends StatelessWidget {
           decoration: BoxDecoration(
             border: Border(
               top: BorderSide(
-                color: isHovering ? EditorColors.accent : Colors.transparent,
+                color: isHovering ? colors.accent : Colors.transparent,
                 width: 2,
               ),
             ),
@@ -1818,6 +1868,7 @@ class EditorTabBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.editorColors;
     final tabWidgets = [
       for (var index = 0; index < tabs.length; index++)
         Builder(
@@ -1848,7 +1899,7 @@ class EditorTabBar extends StatelessWidget {
 
     return Container(
       height: 36,
-      color: EditorColors.tabBar,
+      color: colors.tabBar,
       alignment: Alignment.centerLeft,
       child:
           tabs.isEmpty
@@ -1868,6 +1919,8 @@ class TabReorderDropZone extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.editorColors;
+
     return DragTarget<EditorTabDragPayload>(
       onWillAcceptWithDetails: (_) => true,
       onAcceptWithDetails: (details) => onAcceptTab(details.data),
@@ -1881,7 +1934,7 @@ class TabReorderDropZone extends StatelessWidget {
           decoration: BoxDecoration(
             border: Border(
               left: BorderSide(
-                color: isHovering ? EditorColors.accent : Colors.transparent,
+                color: isHovering ? colors.accent : Colors.transparent,
                 width: 2,
               ),
             ),
@@ -1897,21 +1950,23 @@ class WelcomeTab extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.editorColors;
+
     return Container(
       width: 180,
       height: 36,
       padding: const EdgeInsets.symmetric(horizontal: 12),
-      decoration: const BoxDecoration(
-        color: EditorColors.editor,
-        border: Border(right: BorderSide(color: EditorColors.border, width: 1)),
+      decoration: BoxDecoration(
+        color: colors.editor,
+        border: Border(right: BorderSide(color: colors.border, width: 1)),
       ),
-      child: const Row(
+      child: Row(
         children: [
-          Icon(Icons.home_outlined, size: 15, color: EditorColors.mutedText),
-          SizedBox(width: 8),
+          Icon(Icons.home_outlined, size: 15, color: colors.mutedText),
+          const SizedBox(width: 8),
           Text(
             'Welcome',
-            style: TextStyle(color: EditorColors.primaryText, fontSize: 13),
+            style: TextStyle(color: colors.primaryText, fontSize: 13),
           ),
         ],
       ),
@@ -1941,19 +1996,19 @@ class DocumentTab extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.editorColors;
+
     final tab = Material(
-      color: selected ? EditorColors.editor : EditorColors.tabBar,
+      color: selected ? colors.editor : colors.tabBar,
       child: InkWell(
         onTap: onSelect,
-        hoverColor: EditorColors.panelHeader,
+        hoverColor: colors.panelHeader,
         child: Container(
           width: viewMode == MarkdownViewMode.source ? 190 : 230,
           height: 36,
           padding: const EdgeInsets.only(left: 12, right: 4),
-          decoration: const BoxDecoration(
-            border: Border(
-              right: BorderSide(color: EditorColors.border, width: 1),
-            ),
+          decoration: BoxDecoration(
+            border: Border(right: BorderSide(color: colors.border, width: 1)),
           ),
           child: Row(
             children: [
@@ -1966,8 +2021,8 @@ class DocumentTab extends StatelessWidget {
                 size: 15,
                 color:
                     document.errorMessage == null
-                        ? EditorColors.markdownIcon
-                        : EditorColors.error,
+                        ? colors.markdownIcon
+                        : colors.error,
               ),
               const SizedBox(width: 8),
               Expanded(
@@ -1978,10 +2033,7 @@ class DocumentTab extends StatelessWidget {
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
-                    color:
-                        selected
-                            ? EditorColors.primaryText
-                            : EditorColors.secondaryText,
+                    color: selected ? colors.primaryText : colors.secondaryText,
                     fontSize: 13,
                     fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
                   ),
@@ -1991,10 +2043,7 @@ class DocumentTab extends StatelessWidget {
                 tooltip: 'Close',
                 onPressed: onClose,
                 icon: const Icon(Icons.close, size: 15),
-                color:
-                    selected
-                        ? EditorColors.secondaryText
-                        : EditorColors.mutedText,
+                color: selected ? colors.secondaryText : colors.mutedText,
                 style: IconButton.styleFrom(
                   fixedSize: const Size.square(28),
                   padding: EdgeInsets.zero,
@@ -2022,7 +2071,7 @@ class DocumentTab extends StatelessWidget {
           decoration: BoxDecoration(
             border: Border(
               left: BorderSide(
-                color: isHovering ? EditorColors.accent : Colors.transparent,
+                color: isHovering ? colors.accent : Colors.transparent,
                 width: 2,
               ),
             ),
@@ -2075,7 +2124,8 @@ class _SplitResizeDividerState extends State<SplitResizeDivider> {
 
   @override
   Widget build(BuildContext context) {
-    final dividerColor = _isActive ? EditorColors.accent : EditorColors.border;
+    final colors = context.editorColors;
+    final dividerColor = _isActive ? colors.accent : colors.border;
 
     return MouseRegion(
       cursor: SystemMouseCursors.resizeColumn,
@@ -2115,7 +2165,7 @@ class _SplitResizeDividerState extends State<SplitResizeDivider> {
             decoration: BoxDecoration(
               color:
                   _isActive
-                      ? EditorColors.accent.withValues(alpha: 0.12)
+                      ? colors.accent.withValues(alpha: 0.12)
                       : Colors.transparent,
               border: Border(
                 left: BorderSide(color: dividerColor, width: _isActive ? 2 : 1),
@@ -2147,31 +2197,43 @@ class SplitPreviewOverlay extends StatelessWidget {
   }
 
   Widget _dimmedPane() {
-    return Expanded(
-      child: DecoratedBox(
-        decoration: BoxDecoration(
-          color: EditorColors.background.withValues(alpha: 0.56),
-        ),
-      ),
+    return Builder(
+      builder: (context) {
+        final colors = context.editorColors;
+
+        return Expanded(
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: colors.background.withValues(alpha: 0.56),
+            ),
+          ),
+        );
+      },
     );
   }
 
   Widget _highlightedPane() {
-    return Expanded(
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 120),
-        decoration: BoxDecoration(
-          color: EditorColors.selection.withValues(alpha: 0.68),
-          border: Border.all(color: EditorColors.accent, width: 2),
-        ),
-        child: const Center(
-          child: Icon(
-            Icons.vertical_split_outlined,
-            color: EditorColors.primaryText,
-            size: 32,
+    return Builder(
+      builder: (context) {
+        final colors = context.editorColors;
+
+        return Expanded(
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 120),
+            decoration: BoxDecoration(
+              color: colors.selection.withValues(alpha: 0.68),
+              border: Border.all(color: colors.accent, width: 2),
+            ),
+            child: Center(
+              child: Icon(
+                Icons.vertical_split_outlined,
+                color: colors.primaryText,
+                size: 32,
+              ),
+            ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 }
@@ -2259,13 +2321,14 @@ class _MarkdownSourceEditorState extends State<MarkdownSourceEditor> {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.editorColors;
     final lineCount =
         _textController.text.isEmpty
             ? 1
             : '\n'.allMatches(_textController.text).length + 1;
 
     return DecoratedBox(
-      decoration: const BoxDecoration(color: EditorColors.editor),
+      decoration: BoxDecoration(color: colors.editor),
       child: Scrollbar(
         controller: _scrollController,
         thumbVisibility: true,
@@ -2286,8 +2349,8 @@ class _MarkdownSourceEditorState extends State<MarkdownSourceEditor> {
                         Text(
                           '$line',
                           textAlign: TextAlign.right,
-                          style: const TextStyle(
-                            color: EditorColors.lineNumber,
+                          style: TextStyle(
+                            color: colors.lineNumber,
                             fontFamily: 'Menlo',
                             fontSize: 13,
                             height: 1.55,
@@ -2304,9 +2367,9 @@ class _MarkdownSourceEditorState extends State<MarkdownSourceEditor> {
                   minLines: null,
                   maxLines: null,
                   keyboardType: TextInputType.multiline,
-                  cursorColor: EditorColors.accent,
-                  style: const TextStyle(
-                    color: EditorColors.primaryText,
+                  cursorColor: colors.accent,
+                  style: TextStyle(
+                    color: colors.primaryText,
                     fontFamily: 'Menlo',
                     fontSize: 13,
                     height: 1.55,
@@ -2342,19 +2405,21 @@ class PreviewPane extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.editorColors;
+
     return Column(
       children: [
         const PanelHeader(title: 'PREVIEW'),
         Expanded(
           child: DecoratedBox(
-            decoration: const BoxDecoration(color: EditorColors.preview),
+            decoration: BoxDecoration(color: colors.preview),
             child: Markdown(
               selectable: true,
               data: markdown,
               imageDirectory: imageDirectory,
               onTapLink: (_, href, __) => onTapLink(href),
               padding: const EdgeInsets.fromLTRB(52, 28, 52, 52),
-              styleSheet: markdownStyleSheet,
+              styleSheet: buildMarkdownStyleSheet(colors),
             ),
           ),
         ),
@@ -2370,20 +2435,20 @@ class PanelHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.editorColors;
+
     return Container(
       height: 34,
       padding: const EdgeInsets.symmetric(horizontal: 14),
       alignment: Alignment.centerLeft,
-      decoration: const BoxDecoration(
-        color: EditorColors.panelHeader,
-        border: Border(
-          bottom: BorderSide(color: EditorColors.border, width: 1),
-        ),
+      decoration: BoxDecoration(
+        color: colors.panelHeader,
+        border: Border(bottom: BorderSide(color: colors.border, width: 1)),
       ),
       child: Text(
         title,
-        style: const TextStyle(
-          color: EditorColors.secondaryText,
+        style: TextStyle(
+          color: colors.secondaryText,
           fontSize: 11,
           fontWeight: FontWeight.w700,
           letterSpacing: 0,
@@ -2400,15 +2465,13 @@ class EmptyEditorState extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.editorColors;
+
     return Center(
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const Icon(
-            Icons.description_outlined,
-            size: 46,
-            color: EditorColors.mutedText,
-          ),
+          Icon(Icons.description_outlined, size: 46, color: colors.mutedText),
           const SizedBox(height: 18),
           FilledButton.icon(
             onPressed: onOpenPressed,
@@ -2433,6 +2496,8 @@ class ErrorState extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.editorColors;
+
     return Center(
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 540),
@@ -2441,17 +2506,13 @@ class ErrorState extends StatelessWidget {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Icon(
-                Icons.error_outline,
-                size: 38,
-                color: EditorColors.error,
-              ),
+              Icon(Icons.error_outline, size: 38, color: colors.error),
               const SizedBox(height: 14),
               SelectableText(
                 message,
                 textAlign: TextAlign.center,
-                style: const TextStyle(
-                  color: EditorColors.primaryText,
+                style: TextStyle(
+                  color: colors.primaryText,
                   fontSize: 13,
                   height: 1.45,
                 ),
@@ -2490,10 +2551,12 @@ class StatusBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.editorColors;
+
     return Container(
       height: 24,
       padding: const EdgeInsets.symmetric(horizontal: 10),
-      color: EditorColors.accent,
+      color: colors.accent,
       child: Row(
         children: [
           const Icon(Icons.check, size: 14, color: Colors.white),
@@ -2555,122 +2618,303 @@ bool _isMarkdownPath(String path) {
   return const {'md', 'markdown', 'mdown', 'mkd', 'txt'}.contains(extension);
 }
 
-final MarkdownStyleSheet markdownStyleSheet = MarkdownStyleSheet(
-  p: const TextStyle(
-    color: EditorColors.primaryText,
-    fontSize: 15,
-    height: 1.55,
-  ),
-  a: const TextStyle(
-    color: EditorColors.link,
-    fontSize: 15,
-    height: 1.55,
-    decoration: TextDecoration.underline,
-    decorationColor: EditorColors.link,
-  ),
-  h1: const TextStyle(
-    color: EditorColors.primaryText,
-    fontSize: 30,
-    height: 1.25,
-    fontWeight: FontWeight.w800,
-  ),
-  h1Padding: const EdgeInsets.only(top: 8, bottom: 12),
-  h2: const TextStyle(
-    color: EditorColors.primaryText,
-    fontSize: 22,
-    height: 1.35,
-    fontWeight: FontWeight.w700,
-  ),
-  h2Padding: const EdgeInsets.only(top: 20, bottom: 8),
-  h3: const TextStyle(
-    color: EditorColors.primaryText,
-    fontSize: 18,
-    height: 1.4,
-    fontWeight: FontWeight.w700,
-  ),
-  h3Padding: const EdgeInsets.only(top: 16, bottom: 6),
-  h4: const TextStyle(
-    color: EditorColors.primaryText,
-    fontSize: 16,
-    height: 1.45,
-    fontWeight: FontWeight.w700,
-  ),
-  h5: const TextStyle(
-    color: EditorColors.primaryText,
-    fontSize: 15,
-    height: 1.45,
-    fontWeight: FontWeight.w700,
-  ),
-  h6: const TextStyle(
-    color: EditorColors.secondaryText,
-    fontSize: 14,
-    height: 1.45,
-    fontWeight: FontWeight.w700,
-  ),
-  strong: const TextStyle(fontWeight: FontWeight.w800),
-  em: const TextStyle(fontStyle: FontStyle.italic),
-  code: const TextStyle(
-    color: EditorColors.codeText,
-    backgroundColor: EditorColors.inlineCodeBackground,
-    fontFamily: 'Menlo',
-    fontSize: 13,
-    height: 1.45,
-  ),
-  codeblockPadding: const EdgeInsets.all(14),
-  codeblockDecoration: BoxDecoration(
-    color: EditorColors.codeBlockBackground,
-    borderRadius: BorderRadius.circular(4),
-    border: Border.all(color: EditorColors.border),
-  ),
-  blockquote: const TextStyle(
-    color: EditorColors.secondaryText,
-    fontSize: 15,
-    height: 1.55,
-  ),
-  blockquotePadding: const EdgeInsets.fromLTRB(16, 10, 14, 10),
-  blockquoteDecoration: const BoxDecoration(
-    color: EditorColors.panelHeader,
-    border: Border(left: BorderSide(color: EditorColors.accent, width: 3)),
-  ),
-  tableHead: const TextStyle(
-    color: EditorColors.primaryText,
-    fontWeight: FontWeight.w700,
-  ),
-  tableBody: const TextStyle(
-    color: EditorColors.primaryText,
-    fontSize: 14,
-    height: 1.45,
-  ),
-  tableBorder: TableBorder.all(color: EditorColors.border),
-  tableCellsPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
-  listBullet: const TextStyle(color: EditorColors.primaryText, fontSize: 15),
-  horizontalRuleDecoration: const BoxDecoration(
-    border: Border(top: BorderSide(color: EditorColors.border, width: 1)),
-  ),
-);
+MarkdownStyleSheet buildMarkdownStyleSheet(EditorThemeColors colors) {
+  return MarkdownStyleSheet(
+    p: TextStyle(color: colors.primaryText, fontSize: 15, height: 1.55),
+    a: TextStyle(
+      color: colors.link,
+      fontSize: 15,
+      height: 1.55,
+      decoration: TextDecoration.underline,
+      decorationColor: colors.link,
+    ),
+    h1: TextStyle(
+      color: colors.primaryText,
+      fontSize: 30,
+      height: 1.25,
+      fontWeight: FontWeight.w800,
+    ),
+    h1Padding: const EdgeInsets.only(top: 8, bottom: 12),
+    h2: TextStyle(
+      color: colors.primaryText,
+      fontSize: 22,
+      height: 1.35,
+      fontWeight: FontWeight.w700,
+    ),
+    h2Padding: const EdgeInsets.only(top: 20, bottom: 8),
+    h3: TextStyle(
+      color: colors.primaryText,
+      fontSize: 18,
+      height: 1.4,
+      fontWeight: FontWeight.w700,
+    ),
+    h3Padding: const EdgeInsets.only(top: 16, bottom: 6),
+    h4: TextStyle(
+      color: colors.primaryText,
+      fontSize: 16,
+      height: 1.45,
+      fontWeight: FontWeight.w700,
+    ),
+    h5: TextStyle(
+      color: colors.primaryText,
+      fontSize: 15,
+      height: 1.45,
+      fontWeight: FontWeight.w700,
+    ),
+    h6: TextStyle(
+      color: colors.secondaryText,
+      fontSize: 14,
+      height: 1.45,
+      fontWeight: FontWeight.w700,
+    ),
+    strong: const TextStyle(fontWeight: FontWeight.w800),
+    em: const TextStyle(fontStyle: FontStyle.italic),
+    code: TextStyle(
+      color: colors.codeText,
+      backgroundColor: colors.inlineCodeBackground,
+      fontFamily: 'Menlo',
+      fontSize: 13,
+      height: 1.45,
+    ),
+    codeblockPadding: const EdgeInsets.all(14),
+    codeblockDecoration: BoxDecoration(
+      color: colors.codeBlockBackground,
+      borderRadius: BorderRadius.circular(4),
+      border: Border.all(color: colors.border),
+    ),
+    blockquote: TextStyle(
+      color: colors.secondaryText,
+      fontSize: 15,
+      height: 1.55,
+    ),
+    blockquotePadding: const EdgeInsets.fromLTRB(16, 10, 14, 10),
+    blockquoteDecoration: BoxDecoration(
+      color: colors.panelHeader,
+      border: Border(left: BorderSide(color: colors.accent, width: 3)),
+    ),
+    tableHead: TextStyle(
+      color: colors.primaryText,
+      fontWeight: FontWeight.w700,
+    ),
+    tableBody: TextStyle(color: colors.primaryText, fontSize: 14, height: 1.45),
+    tableBorder: TableBorder.all(color: colors.border),
+    tableCellsPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+    listBullet: TextStyle(color: colors.primaryText, fontSize: 15),
+    horizontalRuleDecoration: BoxDecoration(
+      border: Border(top: BorderSide(color: colors.border, width: 1)),
+    ),
+  );
+}
 
-class EditorColors {
-  static const Color background = Color(0xFF1E1E1E);
-  static const Color titleBar = Color(0xFF2D2D2D);
-  static const Color activityRail = Color(0xFF333333);
-  static const Color sidebar = Color(0xFF252526);
-  static const Color tabBar = Color(0xFF2D2D2D);
-  static const Color editor = Color(0xFF1E1E1E);
-  static const Color preview = Color(0xFF1F1F1F);
-  static const Color panelHeader = Color(0xFF242424);
-  static const Color border = Color(0xFF3C3C3C);
-  static const Color selection = Color(0xFF37373D);
-  static const Color accent = Color(0xFF007ACC);
-  static const Color primaryText = Color(0xFFD4D4D4);
-  static const Color secondaryText = Color(0xFFBDBDBD);
-  static const Color mutedText = Color(0xFF858585);
-  static const Color disabledText = Color(0xFF5F5F5F);
-  static const Color lineNumber = Color(0xFF6E7681);
-  static const Color markdownIcon = Color(0xFFD7BA7D);
-  static const Color codeText = Color(0xFFDCDCAA);
-  static const Color inlineCodeBackground = Color(0xFF3A3324);
-  static const Color codeBlockBackground = Color(0xFF252526);
-  static const Color link = Color(0xFF4FC1FF);
-  static const Color error = Color(0xFFF48771);
-  static const Color danger = Color(0xFFFF5F57);
+ThemeData _buildAppTheme(EditorThemeColors colors, Brightness brightness) {
+  return ThemeData(
+    brightness: brightness,
+    colorScheme: ColorScheme.fromSeed(
+      seedColor: colors.accent,
+      brightness: brightness,
+      surface: colors.background,
+    ),
+    fontFamily: 'SF Pro Text',
+    scaffoldBackgroundColor: colors.background,
+    useMaterial3: true,
+    extensions: [colors],
+  );
+}
+
+@immutable
+class EditorThemeColors extends ThemeExtension<EditorThemeColors> {
+  const EditorThemeColors({
+    required this.background,
+    required this.titleBar,
+    required this.activityRail,
+    required this.sidebar,
+    required this.tabBar,
+    required this.editor,
+    required this.preview,
+    required this.panelHeader,
+    required this.border,
+    required this.selection,
+    required this.accent,
+    required this.primaryText,
+    required this.secondaryText,
+    required this.mutedText,
+    required this.disabledText,
+    required this.lineNumber,
+    required this.markdownIcon,
+    required this.codeText,
+    required this.inlineCodeBackground,
+    required this.codeBlockBackground,
+    required this.link,
+    required this.error,
+    required this.danger,
+  });
+
+  static const darkMode = EditorThemeColors(
+    background: Color(0xFF1E1E1E),
+    titleBar: Color(0xFF2D2D2D),
+    activityRail: Color(0xFF333333),
+    sidebar: Color(0xFF252526),
+    tabBar: Color(0xFF2D2D2D),
+    editor: Color(0xFF1E1E1E),
+    preview: Color(0xFF1F1F1F),
+    panelHeader: Color(0xFF242424),
+    border: Color(0xFF3C3C3C),
+    selection: Color(0xFF37373D),
+    accent: Color(0xFF007ACC),
+    primaryText: Color(0xFFD4D4D4),
+    secondaryText: Color(0xFFBDBDBD),
+    mutedText: Color(0xFF858585),
+    disabledText: Color(0xFF5F5F5F),
+    lineNumber: Color(0xFF6E7681),
+    markdownIcon: Color(0xFFD7BA7D),
+    codeText: Color(0xFFDCDCAA),
+    inlineCodeBackground: Color(0xFF3A3324),
+    codeBlockBackground: Color(0xFF252526),
+    link: Color(0xFF4FC1FF),
+    error: Color(0xFFF48771),
+    danger: Color(0xFFFF5F57),
+  );
+
+  static const lightMode = EditorThemeColors(
+    background: Color(0xFFF5F5F5),
+    titleBar: Color(0xFFEDEDED),
+    activityRail: Color(0xFFE3E3E3),
+    sidebar: Color(0xFFF0F0F0),
+    tabBar: Color(0xFFE7E7E7),
+    editor: Color(0xFFFFFFFF),
+    preview: Color(0xFFFAFAFA),
+    panelHeader: Color(0xFFF3F3F3),
+    border: Color(0xFFD2D2D2),
+    selection: Color(0xFFDDEEFF),
+    accent: Color(0xFF007ACC),
+    primaryText: Color(0xFF1F1F1F),
+    secondaryText: Color(0xFF4F4F4F),
+    mutedText: Color(0xFF7A7A7A),
+    disabledText: Color(0xFF9C9C9C),
+    lineNumber: Color(0xFF8C8C8C),
+    markdownIcon: Color(0xFF8A6A1F),
+    codeText: Color(0xFF7A3E00),
+    inlineCodeBackground: Color(0xFFF2E8D8),
+    codeBlockBackground: Color(0xFFF4F4F4),
+    link: Color(0xFF005FB8),
+    error: Color(0xFFC0392B),
+    danger: Color(0xFFE74C3C),
+  );
+
+  final Color background;
+  final Color titleBar;
+  final Color activityRail;
+  final Color sidebar;
+  final Color tabBar;
+  final Color editor;
+  final Color preview;
+  final Color panelHeader;
+  final Color border;
+  final Color selection;
+  final Color accent;
+  final Color primaryText;
+  final Color secondaryText;
+  final Color mutedText;
+  final Color disabledText;
+  final Color lineNumber;
+  final Color markdownIcon;
+  final Color codeText;
+  final Color inlineCodeBackground;
+  final Color codeBlockBackground;
+  final Color link;
+  final Color error;
+  final Color danger;
+
+  @override
+  EditorThemeColors copyWith({
+    Color? background,
+    Color? titleBar,
+    Color? activityRail,
+    Color? sidebar,
+    Color? tabBar,
+    Color? editor,
+    Color? preview,
+    Color? panelHeader,
+    Color? border,
+    Color? selection,
+    Color? accent,
+    Color? primaryText,
+    Color? secondaryText,
+    Color? mutedText,
+    Color? disabledText,
+    Color? lineNumber,
+    Color? markdownIcon,
+    Color? codeText,
+    Color? inlineCodeBackground,
+    Color? codeBlockBackground,
+    Color? link,
+    Color? error,
+    Color? danger,
+  }) {
+    return EditorThemeColors(
+      background: background ?? this.background,
+      titleBar: titleBar ?? this.titleBar,
+      activityRail: activityRail ?? this.activityRail,
+      sidebar: sidebar ?? this.sidebar,
+      tabBar: tabBar ?? this.tabBar,
+      editor: editor ?? this.editor,
+      preview: preview ?? this.preview,
+      panelHeader: panelHeader ?? this.panelHeader,
+      border: border ?? this.border,
+      selection: selection ?? this.selection,
+      accent: accent ?? this.accent,
+      primaryText: primaryText ?? this.primaryText,
+      secondaryText: secondaryText ?? this.secondaryText,
+      mutedText: mutedText ?? this.mutedText,
+      disabledText: disabledText ?? this.disabledText,
+      lineNumber: lineNumber ?? this.lineNumber,
+      markdownIcon: markdownIcon ?? this.markdownIcon,
+      codeText: codeText ?? this.codeText,
+      inlineCodeBackground: inlineCodeBackground ?? this.inlineCodeBackground,
+      codeBlockBackground: codeBlockBackground ?? this.codeBlockBackground,
+      link: link ?? this.link,
+      error: error ?? this.error,
+      danger: danger ?? this.danger,
+    );
+  }
+
+  @override
+  EditorThemeColors lerp(ThemeExtension<EditorThemeColors>? other, double t) {
+    if (other is! EditorThemeColors) {
+      return this;
+    }
+
+    return EditorThemeColors(
+      background: Color.lerp(background, other.background, t)!,
+      titleBar: Color.lerp(titleBar, other.titleBar, t)!,
+      activityRail: Color.lerp(activityRail, other.activityRail, t)!,
+      sidebar: Color.lerp(sidebar, other.sidebar, t)!,
+      tabBar: Color.lerp(tabBar, other.tabBar, t)!,
+      editor: Color.lerp(editor, other.editor, t)!,
+      preview: Color.lerp(preview, other.preview, t)!,
+      panelHeader: Color.lerp(panelHeader, other.panelHeader, t)!,
+      border: Color.lerp(border, other.border, t)!,
+      selection: Color.lerp(selection, other.selection, t)!,
+      accent: Color.lerp(accent, other.accent, t)!,
+      primaryText: Color.lerp(primaryText, other.primaryText, t)!,
+      secondaryText: Color.lerp(secondaryText, other.secondaryText, t)!,
+      mutedText: Color.lerp(mutedText, other.mutedText, t)!,
+      disabledText: Color.lerp(disabledText, other.disabledText, t)!,
+      lineNumber: Color.lerp(lineNumber, other.lineNumber, t)!,
+      markdownIcon: Color.lerp(markdownIcon, other.markdownIcon, t)!,
+      codeText: Color.lerp(codeText, other.codeText, t)!,
+      inlineCodeBackground:
+          Color.lerp(inlineCodeBackground, other.inlineCodeBackground, t)!,
+      codeBlockBackground:
+          Color.lerp(codeBlockBackground, other.codeBlockBackground, t)!,
+      link: Color.lerp(link, other.link, t)!,
+      error: Color.lerp(error, other.error, t)!,
+      danger: Color.lerp(danger, other.danger, t)!,
+    );
+  }
+}
+
+extension EditorThemeContext on BuildContext {
+  EditorThemeColors get editorColors =>
+      Theme.of(this).extension<EditorThemeColors>()!;
 }
