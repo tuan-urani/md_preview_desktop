@@ -14,17 +14,18 @@ import 'package:window_manager/window_manager.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  if (Platform.isMacOS) {
+  if (Platform.isMacOS || Platform.isWindows) {
     await windowManager.ensureInitialized();
 
-    const windowOptions = WindowOptions(
+    final windowOptions = WindowOptions(
       size: Size(1280, 820),
       minimumSize: Size(920, 560),
       center: true,
       title: 'MD Preview',
-      titleBarStyle: TitleBarStyle.hidden,
-      windowButtonVisibility: true,
-      backgroundColor: Color(0xFF1E1E1E),
+      titleBarStyle:
+          Platform.isMacOS ? TitleBarStyle.hidden : TitleBarStyle.normal,
+      windowButtonVisibility: Platform.isMacOS,
+      backgroundColor: const Color(0xFF1E1E1E),
     );
 
     windowManager.waitUntilReadyToShow(windowOptions, () async {
@@ -226,8 +227,12 @@ class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
       return;
     }
 
-    final markdownPaths = paths.where(_isMarkdownPath).toList();
-    unawaited(_openFiles(markdownPaths.isEmpty ? paths : markdownPaths));
+    final supportedPaths = paths.where(_isMarkdownPath).toList();
+    if (supportedPaths.isEmpty) {
+      return;
+    }
+
+    unawaited(_openFiles(supportedPaths));
   }
 
   Future<void> _openFiles(Iterable<String> filePaths) async {
@@ -984,8 +989,12 @@ class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
       return;
     }
 
-    if (Platform.isMacOS && await File(targetPath).exists()) {
-      await Process.run('open', [targetPath]);
+    if ((Platform.isMacOS || Platform.isWindows) &&
+        await File(targetPath).exists()) {
+      await launchUrl(
+        Uri.file(targetPath),
+        mode: LaunchMode.externalApplication,
+      );
     }
   }
 
@@ -1351,8 +1360,15 @@ class NativeFileOpenBridge {
   static Future<void> attach({
     required void Function(List<String> paths) onOpenFiles,
   }) async {
-    if (!Platform.isMacOS) {
+    if (!Platform.isMacOS && !Platform.isWindows) {
       return;
+    }
+
+    if (Platform.isWindows) {
+      final launchPaths = _pathsFromArguments(Platform.executableArguments);
+      if (launchPaths.isNotEmpty) {
+        onOpenFiles(launchPaths);
+      }
     }
 
     _channel.setMethodCallHandler((call) async {
@@ -1377,7 +1393,7 @@ class NativeFileOpenBridge {
         onOpenFiles(pendingPaths);
       }
     } on MissingPluginException {
-      // The bridge exists only on macOS.
+      // Native open-file bridges exist only on desktop runners that implement it.
     }
   }
 
