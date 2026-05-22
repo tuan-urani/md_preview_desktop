@@ -175,7 +175,7 @@ class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
   SplitDropSide? _dragSplitSide;
   double _leftEditorFraction = 0.5;
   bool _isLoading = false;
-  bool _autoReload = true;
+  final bool _autoReload = true;
   bool _isExplorerVisible = true;
   double _explorerWidth = _defaultExplorerWidth;
 
@@ -203,8 +203,6 @@ class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
       _activeTab?.viewMode ?? MarkdownViewMode.preview;
 
   String? get _filePath => _activeDocument?.filePath;
-  String get _markdown => _activeDocument?.markdown ?? '';
-  DateTime? get _lastModified => _activeDocument?.lastModified;
 
   @override
   void initState() {
@@ -510,14 +508,6 @@ class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
             ? 'MD Preview'
             : '${p.basename(filePath)} - MD Preview';
     await windowManager.setTitle(title);
-  }
-
-  void _setAutoReload(bool value) {
-    setState(() {
-      _autoReload = value;
-    });
-
-    unawaited(_restartWatcherForActiveDocument());
   }
 
   void _toggleExplorer() {
@@ -1008,18 +998,6 @@ class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
     return filePath == null ? 'Welcome' : p.basename(filePath);
   }
 
-  int get _lineCount {
-    if (_markdown.isEmpty) {
-      return 0;
-    }
-
-    return '\n'.allMatches(_markdown).length + 1;
-  }
-
-  int get _wordCount {
-    return RegExp(r'\S+').allMatches(_markdown).length;
-  }
-
   @override
   Widget build(BuildContext context) {
     final colors = context.editorColors;
@@ -1080,14 +1058,6 @@ class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
                   ),
                 ],
               ),
-            ),
-            StatusBar(
-              filePath: _filePath,
-              lineCount: _lineCount,
-              wordCount: _wordCount,
-              lastModified: _lastModified,
-              autoReload: _autoReload,
-              onAutoReloadChanged: _setAutoReload,
             ),
           ],
         ),
@@ -1558,13 +1528,6 @@ class ActivityRail extends StatelessWidget {
             tooltip: 'Explorer',
             onPressed: onExplorerPressed,
           ),
-          const Spacer(),
-          const RailIcon(
-            icon: Icons.settings_outlined,
-            selected: false,
-            tooltip: 'Settings',
-          ),
-          const SizedBox(height: 10),
         ],
       ),
     );
