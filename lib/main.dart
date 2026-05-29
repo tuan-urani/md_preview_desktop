@@ -146,6 +146,13 @@ class MarkdownEditorTab {
   final MarkdownViewMode viewMode;
 }
 
+class SourceRevealRequest {
+  const SourceRevealRequest({required this.id, required this.offset});
+
+  final int id;
+  final int offset;
+}
+
 class EditorTabDragPayload {
   const EditorTabDragPayload({required this.groupId, required this.tabIndex});
 
@@ -154,6 +161,7 @@ class EditorTabDragPayload {
 }
 
 class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
+  static const double _mobileBreakpoint = 700;
   static const double _defaultExplorerWidth = 250;
   static const double _minExplorerWidth = 180;
   static const double _maxExplorerWidth = 420;
@@ -164,10 +172,17 @@ class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
   StreamSubscription<WatchEvent>? _watchSubscription;
   Timer? _reloadDebounce;
   final Map<String, Timer> _autoSaveDebounces = {};
+  final Map<String, double> _previewScrollOffsets = {};
+  final Map<String, double> _sourceScrollOffsets = {};
+  final Map<String, GlobalKey<_PreviewPaneState>> _mobilePreviewKeys = {};
+  final Map<String, GlobalKey<_MarkdownSourceEditorState>>
+  _mobileSourceEditorKeys = {};
 
   final List<MarkdownDocument> _documents = [];
   final List<MarkdownEditorTab> _tabs = [];
   final List<MarkdownEditorTab> _splitTabs = [];
+  final Map<String, SourceRevealRequest> _sourceRevealRequests = {};
+  int _nextSourceRevealRequestId = 0;
   int _activeTabIndex = -1;
   int _activeSplitTabIndex = -1;
   EditorGroupId _activeGroupId = EditorGroupId.primary;
@@ -178,6 +193,8 @@ class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
   final bool _autoReload = true;
   bool _isExplorerVisible = true;
   double _explorerWidth = _defaultExplorerWidth;
+  bool _isMobileDocumentVisible = false;
+  MarkdownViewMode _mobileViewMode = MarkdownViewMode.preview;
 
   MarkdownEditorTab? get _activeTab {
     final tabs = _tabsForGroup(_activeGroupId);
@@ -272,6 +289,8 @@ class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
         _ensureEditorTabsForFile(normalizedPath);
         _activeTabIndex = _indexOfTab(normalizedPath, MarkdownViewMode.preview);
         _activeGroupId = EditorGroupId.primary;
+        _isMobileDocumentVisible = true;
+        _mobileViewMode = MarkdownViewMode.preview;
       }
       _isLoading = true;
     });
@@ -305,6 +324,8 @@ class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
         _ensureEditorTabsForFile(normalizedPath);
         _activeTabIndex = _indexOfTab(normalizedPath, MarkdownViewMode.preview);
         _activeGroupId = EditorGroupId.primary;
+        _isMobileDocumentVisible = true;
+        _mobileViewMode = MarkdownViewMode.preview;
         _isLoading = false;
       });
 
@@ -332,6 +353,8 @@ class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
         _ensureEditorTabsForFile(normalizedPath);
         _activeTabIndex = _indexOfTab(normalizedPath, MarkdownViewMode.preview);
         _activeGroupId = EditorGroupId.primary;
+        _isMobileDocumentVisible = true;
+        _mobileViewMode = MarkdownViewMode.preview;
         _isLoading = false;
       });
 
@@ -574,6 +597,121 @@ class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
     _activateEditorTab(_activeGroupId, tabIndex);
   }
 
+  void _revealSourceFromPreview(
+    EditorGroupId previewGroupId,
+    String filePath,
+    int offset,
+  ) {
+    final otherGroupId =
+        previewGroupId == EditorGroupId.primary
+            ? EditorGroupId.split
+            : EditorGroupId.primary;
+    final otherSourceIndex = _indexOfTabInGroup(
+      otherGroupId,
+      filePath,
+      MarkdownViewMode.source,
+    );
+    final previewGroupSourceIndex = _indexOfTabInGroup(
+      previewGroupId,
+      filePath,
+      MarkdownViewMode.source,
+    );
+
+    final targetGroupId =
+        otherSourceIndex != -1 ? otherGroupId : previewGroupId;
+    var targetIndex =
+        otherSourceIndex != -1 ? otherSourceIndex : previewGroupSourceIndex;
+
+    setState(() {
+      if (targetIndex == -1) {
+        final targetTabs = _tabsForGroup(targetGroupId);
+        targetTabs.add(
+          MarkdownEditorTab(
+            filePath: filePath,
+            viewMode: MarkdownViewMode.source,
+          ),
+        );
+        targetIndex = targetTabs.length - 1;
+      }
+
+      _sourceRevealRequests[filePath] = SourceRevealRequest(
+        id: _nextSourceRevealRequestId++,
+        offset: offset,
+      );
+      _activeGroupId = targetGroupId;
+      _setActiveIndexForGroup(targetGroupId, targetIndex);
+      _isLoading = false;
+    });
+
+    unawaited(_restartWatcherForActiveDocument());
+    unawaited(_setWindowTitle(_filePath));
+  }
+
+  void _consumeSourceRevealRequest(String filePath, int requestId) {
+    final request = _sourceRevealRequests[filePath];
+    if (request?.id == requestId) {
+      _sourceRevealRequests.remove(filePath);
+    }
+  }
+
+  void _showMobileFiles() {
+    FocusManager.instance.primaryFocus?.unfocus();
+    setState(() {
+      _isMobileDocumentVisible = false;
+      _mobileViewMode = MarkdownViewMode.preview;
+    });
+  }
+
+  void _openDocumentForMobile(String filePath) {
+    final previewIndex = _indexOfTabInGroup(
+      EditorGroupId.primary,
+      filePath,
+      MarkdownViewMode.preview,
+    );
+
+    setState(() {
+      _ensureEditorTabsForFile(filePath);
+      _activeGroupId = EditorGroupId.primary;
+      _activeTabIndex =
+          previewIndex == -1
+              ? _indexOfTab(filePath, MarkdownViewMode.preview)
+              : previewIndex;
+      _isMobileDocumentVisible = true;
+      _mobileViewMode = MarkdownViewMode.preview;
+      _isLoading = false;
+    });
+
+    unawaited(_restartWatcherForActiveDocument());
+    unawaited(_setWindowTitle(_filePath));
+  }
+
+  void _openMobileSource() {
+    if (_activeDocument == null) {
+      return;
+    }
+
+    setState(() {
+      _mobileViewMode = MarkdownViewMode.source;
+    });
+  }
+
+  void _revealMobileSource(String filePath, int offset) {
+    setState(() {
+      _sourceRevealRequests[filePath] = SourceRevealRequest(
+        id: _nextSourceRevealRequestId++,
+        offset: offset,
+      );
+      _mobileViewMode = MarkdownViewMode.source;
+    });
+  }
+
+  void _showMobilePreview() {
+    FocusManager.instance.primaryFocus?.unfocus();
+    setState(() {
+      _mobileViewMode = MarkdownViewMode.preview;
+    });
+  }
+
   void _closeEditorTab(EditorGroupId groupId, int tabIndex) {
     final tabs = _tabsForGroup(groupId);
     if (tabIndex < 0 || tabIndex >= tabs.length) {
@@ -641,6 +779,15 @@ class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
     final oldPrimaryActiveTab = _activeTabForGroup(EditorGroupId.primary);
     final oldSplitActiveTab = _activeTabForGroup(EditorGroupId.split);
     _cancelAutoSave(filePath);
+    _sourceRevealRequests.remove(filePath);
+    for (final groupId in EditorGroupId.values) {
+      _previewScrollOffsets.remove('${groupId.name}:$filePath');
+      _sourceScrollOffsets.remove('${groupId.name}:$filePath');
+    }
+    _previewScrollOffsets.remove('mobile-preview:$filePath');
+    _sourceScrollOffsets.remove('mobile-source:$filePath');
+    _mobilePreviewKeys.remove(filePath);
+    _mobileSourceEditorKeys.remove(filePath);
 
     setState(() {
       _documents.removeWhere((document) => document.filePath == filePath);
@@ -658,6 +805,9 @@ class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
         oldSplitActiveTab,
       );
       _normalizeActiveGroupAfterTabChange();
+      if (_documents.isEmpty) {
+        _isMobileDocumentVisible = false;
+      }
       _isLoading = false;
     });
 
@@ -1000,68 +1150,157 @@ class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
 
   @override
   Widget build(BuildContext context) {
-    final colors = context.editorColors;
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final colors = context.editorColors;
+        final isMobile = constraints.maxWidth < _mobileBreakpoint;
+
+        return Scaffold(
+          body: ColoredBox(
+            color: colors.background,
+            child:
+                isMobile
+                    ? _buildMobileWorkspace()
+                    : _buildDesktopWorkspace(colors),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildDesktopWorkspace(EditorThemeColors colors) {
     final singleVisibleGroup = _singleVisibleEditorGroup;
 
-    return Scaffold(
-      body: ColoredBox(
-        color: colors.background,
-        child: Column(
-          children: [
-            EditorWindowBar(
-              fileName: _fileName,
-              onOpenPressed: _pickFile,
-              onReloadPressed:
-                  _filePath == null ? null : () => _reloadCurrentFile(),
-              activeViewMode: _activeViewMode,
-              onToggleViewMode:
-                  _filePath == null ? null : _activateOrOpenSiblingTab,
-              currentThemeMode: widget.currentThemeMode,
-              onToggleThemeMode: widget.onToggleThemeMode,
-            ),
-            Expanded(
-              child: Row(
-                children: [
-                  ActivityRail(
-                    isExplorerVisible: _isExplorerVisible,
-                    onExplorerPressed: _toggleExplorer,
+    return Column(
+      children: [
+        EditorWindowBar(
+          fileName: _fileName,
+          onOpenPressed: _pickFile,
+          onReloadPressed:
+              _filePath == null ? null : () => _reloadCurrentFile(),
+          activeViewMode: _activeViewMode,
+          onToggleViewMode:
+              _filePath == null ? null : _activateOrOpenSiblingTab,
+          currentThemeMode: widget.currentThemeMode,
+          onToggleThemeMode: widget.onToggleThemeMode,
+        ),
+        Expanded(
+          child: Row(
+            children: [
+              ActivityRail(
+                isExplorerVisible: _isExplorerVisible,
+                onExplorerPressed: _toggleExplorer,
+              ),
+              if (_isExplorerVisible) ...[
+                SizedBox(
+                  width: _explorerWidth,
+                  child: ExplorerPane(
+                    documents: _documents,
+                    activeFilePath: _filePath,
+                    onOpenPressed: _pickFile,
+                    onSelectDocument: _activateDocumentFromExplorer,
+                    onRemoveDocument: _removeDocumentFromExplorer,
+                    onReorderDocument: _reorderDocumentInExplorer,
                   ),
-                  if (_isExplorerVisible) ...[
-                    SizedBox(
-                      width: _explorerWidth,
-                      child: ExplorerPane(
-                        documents: _documents,
-                        activeFilePath: _filePath,
-                        onOpenPressed: _pickFile,
-                        onSelectDocument: _activateDocumentFromExplorer,
-                        onRemoveDocument: _removeDocumentFromExplorer,
-                        onReorderDocument: _reorderDocumentInExplorer,
+                ),
+                SplitResizeDivider(
+                  onDragDelta: _resizeExplorerByDelta,
+                  onReset: _resetExplorerWidth,
+                ),
+              ],
+              Expanded(
+                child: Column(
+                  children: [
+                    if (singleVisibleGroup != null)
+                      _buildEditorTabBar(singleVisibleGroup),
+                    Expanded(
+                      child: _buildEditorGroups(
+                        showTabBar: singleVisibleGroup == null,
                       ),
                     ),
-                    SplitResizeDivider(
-                      onDragDelta: _resizeExplorerByDelta,
-                      onReset: _resetExplorerWidth,
-                    ),
                   ],
-                  Expanded(
-                    child: Column(
-                      children: [
-                        if (singleVisibleGroup != null)
-                          _buildEditorTabBar(singleVisibleGroup),
-                        Expanded(
-                          child: _buildEditorGroups(
-                            showTabBar: singleVisibleGroup == null,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
-      ),
+      ],
+    );
+  }
+
+  Widget _buildMobileWorkspace() {
+    final activeDocument = _activeDocument;
+    if (!_isMobileDocumentVisible || activeDocument == null) {
+      return MobileFileBrowser(
+        documents: _documents,
+        onOpenPressed: _pickFile,
+        onSelectDocument: _openDocumentForMobile,
+        onRemoveDocument: _removeDocumentFromExplorer,
+      );
+    }
+
+    return MobileDocumentWorkspace(
+      document: activeDocument,
+      viewMode: _mobileViewMode,
+      isLoading: _isLoading,
+      onBackToFiles: _showMobileFiles,
+      onEditPressed: _openMobileSource,
+      onDonePressed: _showMobilePreview,
+      onSearchPressed:
+          _mobileViewMode == MarkdownViewMode.source
+              ? () =>
+                  _mobileSourceEditorKeys[activeDocument.filePath]?.currentState
+                      ?._openFind()
+              : () =>
+                  _mobilePreviewKeys[activeDocument.filePath]?.currentState
+                      ?._openFind(),
+      preview: _buildMobilePreview(activeDocument),
+      source: _buildMobileSource(activeDocument),
+      onOpenPressed: _pickFile,
+    );
+  }
+
+  Widget _buildMobilePreview(MarkdownDocument document) {
+    final scrollKey = 'mobile-preview:${document.filePath}';
+    return PreviewPane(
+      key:
+          _mobilePreviewKeys[document.filePath] ??=
+              GlobalKey<_PreviewPaneState>(),
+      showPanelHeader: false,
+      selectable: true,
+      revealOnDoubleTap: false,
+      selectionToolbarEditEnabled: true,
+      contentPadding: const EdgeInsets.fromLTRB(20, 20, 20, 36),
+      initialScrollOffset: _previewScrollOffsets[scrollKey] ?? 0,
+      onScrollPositionChanged:
+          (offset) => _previewScrollOffsets[scrollKey] = offset,
+      markdown: document.markdown,
+      imageDirectory: _imageDirectoryForFile(document.filePath),
+      onTapLink: (href) => _openMarkdownLinkForFile(document.filePath, href),
+      onRevealSource:
+          (offset) => _revealMobileSource(document.filePath, offset),
+      onOpenSource: _openMobileSource,
+    );
+  }
+
+  Widget _buildMobileSource(MarkdownDocument document) {
+    final scrollKey = 'mobile-source:${document.filePath}';
+    return SourcePane(
+      key: ValueKey<String>(scrollKey),
+      editorKey:
+          _mobileSourceEditorKeys[document.filePath] ??=
+              GlobalKey<_MarkdownSourceEditorState>(),
+      showPanelHeader: false,
+      filePath: document.filePath,
+      markdown: document.markdown,
+      onChanged: _updateDocumentMarkdown,
+      initialScrollOffset: _sourceScrollOffsets[scrollKey] ?? 0,
+      onScrollPositionChanged:
+          (offset) => _sourceScrollOffsets[scrollKey] = offset,
+      revealRequest: _sourceRevealRequests[document.filePath],
+      onRevealConsumed:
+          (requestId) =>
+              _consumeSourceRevealRequest(document.filePath, requestId),
     );
   }
 
@@ -1305,21 +1544,41 @@ class _MarkdownStudioPageState extends State<MarkdownStudioPage> {
       );
     }
 
+    final previewScrollKey = '${groupId.name}:${activeDocument.filePath}';
     final previewPane = PreviewPane(
+      key: ValueKey<String>(previewScrollKey),
+      initialScrollOffset: _previewScrollOffsets[previewScrollKey] ?? 0,
+      onScrollPositionChanged:
+          (offset) => _previewScrollOffsets[previewScrollKey] = offset,
       markdown: activeDocument.markdown,
       imageDirectory: _imageDirectoryForFile(activeDocument.filePath),
       onTapLink:
           (href) => _openMarkdownLinkForFile(activeDocument.filePath, href),
+      onRevealSource:
+          (offset) => _revealSourceFromPreview(
+            groupId,
+            activeDocument.filePath,
+            offset,
+          ),
     );
 
     if (activeTab.viewMode == MarkdownViewMode.preview) {
       return previewPane;
     }
 
+    final sourceScrollKey = '${groupId.name}:${activeDocument.filePath}';
     return SourcePane(
+      key: ValueKey<String>('source:$sourceScrollKey'),
       filePath: activeDocument.filePath,
       markdown: activeDocument.markdown,
       onChanged: _updateDocumentMarkdown,
+      initialScrollOffset: _sourceScrollOffsets[sourceScrollKey] ?? 0,
+      onScrollPositionChanged:
+          (offset) => _sourceScrollOffsets[sourceScrollKey] = offset,
+      revealRequest: _sourceRevealRequests[activeDocument.filePath],
+      onRevealConsumed:
+          (requestId) =>
+              _consumeSourceRevealRequest(activeDocument.filePath, requestId),
     );
   }
 }
@@ -1377,6 +1636,238 @@ class NativeFileOpenBridge {
     }
 
     return const [];
+  }
+}
+
+class MobileFileBrowser extends StatelessWidget {
+  const MobileFileBrowser({
+    super.key,
+    required this.documents,
+    required this.onOpenPressed,
+    required this.onSelectDocument,
+    required this.onRemoveDocument,
+  });
+
+  final List<MarkdownDocument> documents;
+  final VoidCallback onOpenPressed;
+  final ValueChanged<String> onSelectDocument;
+  final ValueChanged<String> onRemoveDocument;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = context.editorColors;
+
+    return SafeArea(
+      child: Column(
+        children: [
+          MobileTopBar(
+            title: 'Markdown Files',
+            trailing: IconButton(
+              key: const ValueKey<String>('mobile-open-file'),
+              onPressed: onOpenPressed,
+              icon: const Icon(Icons.add),
+              color: colors.primaryText,
+            ),
+          ),
+          Expanded(
+            child:
+                documents.isEmpty
+                    ? EmptyEditorState(onOpenPressed: onOpenPressed)
+                    : ListView.separated(
+                      padding: const EdgeInsets.fromLTRB(12, 12, 12, 24),
+                      itemCount: documents.length,
+                      separatorBuilder: (_, __) => const SizedBox(height: 4),
+                      itemBuilder: (context, index) {
+                        final document = documents[index];
+                        return ListTile(
+                          key: ValueKey<String>(
+                            'mobile-document:${document.filePath}',
+                          ),
+                          onTap: () => onSelectDocument(document.filePath),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          tileColor: colors.panelHeader,
+                          leading: Icon(
+                            Icons.description_outlined,
+                            color: colors.markdownIcon,
+                          ),
+                          title: Text(
+                            document.fileName,
+                            style: TextStyle(color: colors.primaryText),
+                          ),
+                          subtitle: Text(
+                            document.folderName,
+                            style: TextStyle(color: colors.secondaryText),
+                          ),
+                          trailing: IconButton(
+                            onPressed:
+                                () => onRemoveDocument(document.filePath),
+                            icon: const Icon(Icons.close, size: 18),
+                            color: colors.secondaryText,
+                          ),
+                        );
+                      },
+                    ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class MobileDocumentWorkspace extends StatelessWidget {
+  const MobileDocumentWorkspace({
+    super.key,
+    required this.document,
+    required this.viewMode,
+    required this.isLoading,
+    required this.onBackToFiles,
+    required this.onEditPressed,
+    required this.onDonePressed,
+    this.onSearchPressed,
+    required this.preview,
+    required this.source,
+    required this.onOpenPressed,
+  });
+
+  final MarkdownDocument document;
+  final MarkdownViewMode viewMode;
+  final bool isLoading;
+  final VoidCallback onBackToFiles;
+  final VoidCallback onEditPressed;
+  final VoidCallback onDonePressed;
+  final VoidCallback? onSearchPressed;
+  final Widget preview;
+  final Widget source;
+  final VoidCallback onOpenPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final isSource = viewMode == MarkdownViewMode.source;
+
+    Widget content = isSource ? source : preview;
+    if (isLoading &&
+        document.markdown.isEmpty &&
+        document.errorMessage == null) {
+      content = const Center(child: CircularProgressIndicator(strokeWidth: 2));
+    } else if (document.errorMessage != null && document.markdown.isEmpty) {
+      content = ErrorState(
+        message: document.errorMessage!,
+        onOpenPressed: onOpenPressed,
+      );
+    }
+
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) {
+          return;
+        }
+        if (isSource) {
+          onDonePressed();
+        } else {
+          onBackToFiles();
+        }
+      },
+      child: SafeArea(
+        child: Column(
+          children: [
+            MobileTopBar(
+              title: document.fileName,
+              leading: IconButton(
+                key: ValueKey<String>(
+                  isSource ? 'mobile-back-preview' : 'mobile-back-files',
+                ),
+                onPressed: isSource ? onDonePressed : onBackToFiles,
+                icon: const Icon(Icons.arrow_back_ios_new, size: 18),
+              ),
+              trailingWidth: 128,
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
+                    key: ValueKey<String>(
+                      isSource
+                          ? 'mobile-source-search'
+                          : 'mobile-preview-search',
+                    ),
+                    tooltip: 'Find',
+                    onPressed: onSearchPressed,
+                    icon: const Icon(Icons.search, size: 20),
+                    constraints: const BoxConstraints.tightFor(
+                      width: 40,
+                      height: 40,
+                    ),
+                    padding: EdgeInsets.zero,
+                  ),
+                  TextButton(
+                    key: ValueKey<String>(
+                      isSource ? 'mobile-done' : 'mobile-edit',
+                    ),
+                    onPressed: isSource ? onDonePressed : onEditPressed,
+                    style: TextButton.styleFrom(
+                      minimumSize: const Size(58, 40),
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                    child: Text(isSource ? 'Done' : 'Edit'),
+                  ),
+                ],
+              ),
+            ),
+            Expanded(child: content),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class MobileTopBar extends StatelessWidget {
+  const MobileTopBar({
+    super.key,
+    required this.title,
+    this.leading,
+    this.trailing,
+    this.trailingWidth = 64,
+  });
+
+  final String title;
+  final Widget? leading;
+  final Widget? trailing;
+  final double trailingWidth;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = context.editorColors;
+
+    return Container(
+      height: 52,
+      decoration: BoxDecoration(
+        color: colors.titleBar,
+        border: Border(bottom: BorderSide(color: colors.border)),
+      ),
+      child: Row(
+        children: [
+          SizedBox(width: 52, child: leading),
+          Expanded(
+            child: Text(
+              title,
+              textAlign: TextAlign.center,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: colors.primaryText,
+                fontWeight: FontWeight.w600,
+                fontSize: 15,
+              ),
+            ),
+          ),
+          SizedBox(width: trailingWidth, child: Center(child: trailing)),
+        ],
+      ),
+    );
   }
 }
 
@@ -2220,25 +2711,42 @@ class SplitPreviewOverlay extends StatelessWidget {
 class SourcePane extends StatelessWidget {
   const SourcePane({
     super.key,
+    this.editorKey,
+    this.showPanelHeader = true,
     required this.filePath,
     required this.markdown,
     required this.onChanged,
+    required this.initialScrollOffset,
+    required this.onScrollPositionChanged,
+    required this.revealRequest,
+    required this.onRevealConsumed,
   });
 
+  final Key? editorKey;
+  final bool showPanelHeader;
   final String filePath;
   final String markdown;
   final void Function(String filePath, String markdown) onChanged;
+  final double initialScrollOffset;
+  final ValueChanged<double> onScrollPositionChanged;
+  final SourceRevealRequest? revealRequest;
+  final ValueChanged<int> onRevealConsumed;
 
   @override
   Widget build(BuildContext context) {
     return Column(
       children: [
-        const PanelHeader(title: 'SOURCE'),
+        if (showPanelHeader) const PanelHeader(title: 'SOURCE'),
         Expanded(
           child: MarkdownSourceEditor(
+            key: editorKey,
             filePath: filePath,
             markdown: markdown,
             onChanged: onChanged,
+            initialScrollOffset: initialScrollOffset,
+            onScrollPositionChanged: onScrollPositionChanged,
+            revealRequest: revealRequest,
+            onRevealConsumed: onRevealConsumed,
           ),
         ),
       ],
@@ -2252,25 +2760,161 @@ class MarkdownSourceEditor extends StatefulWidget {
     required this.filePath,
     required this.markdown,
     required this.onChanged,
+    this.initialScrollOffset = 0,
+    this.onScrollPositionChanged,
+    required this.revealRequest,
+    this.onRevealConsumed,
   });
 
   final String filePath;
   final String markdown;
   final void Function(String filePath, String markdown) onChanged;
+  final double initialScrollOffset;
+  final ValueChanged<double>? onScrollPositionChanged;
+  final SourceRevealRequest? revealRequest;
+  final ValueChanged<int>? onRevealConsumed;
 
   @override
   State<MarkdownSourceEditor> createState() => _MarkdownSourceEditorState();
 }
 
+class _SearchHighlightTextController extends TextEditingController {
+  _SearchHighlightTextController({super.text});
+
+  List<int> _matchOffsets = const [];
+  int _currentMatchIndex = -1;
+  int _queryLength = 0;
+  Color _matchColor = Colors.transparent;
+  Color _currentMatchColor = Colors.transparent;
+
+  void updateSearchHighlights({
+    required List<int> matchOffsets,
+    required int currentMatchIndex,
+    required int queryLength,
+    required Color matchColor,
+    required Color currentMatchColor,
+  }) {
+    final shouldNotify =
+        !_listEquals(_matchOffsets, matchOffsets) ||
+        _currentMatchIndex != currentMatchIndex ||
+        _queryLength != queryLength ||
+        _matchColor != matchColor ||
+        _currentMatchColor != currentMatchColor;
+
+    if (!shouldNotify) {
+      return;
+    }
+
+    _matchOffsets = List<int>.of(matchOffsets);
+    _currentMatchIndex = currentMatchIndex;
+    _queryLength = queryLength;
+    _matchColor = matchColor;
+    _currentMatchColor = currentMatchColor;
+    notifyListeners();
+  }
+
+  void clearSearchHighlights() {
+    updateSearchHighlights(
+      matchOffsets: const [],
+      currentMatchIndex: -1,
+      queryLength: 0,
+      matchColor: Colors.transparent,
+      currentMatchColor: Colors.transparent,
+    );
+  }
+
+  @override
+  TextSpan buildTextSpan({
+    required BuildContext context,
+    TextStyle? style,
+    required bool withComposing,
+  }) {
+    if (_matchOffsets.isEmpty || _queryLength <= 0 || text.isEmpty) {
+      return super.buildTextSpan(
+        context: context,
+        style: style,
+        withComposing: withComposing,
+      );
+    }
+
+    final children = <TextSpan>[];
+    var cursor = 0;
+
+    for (var index = 0; index < _matchOffsets.length; index++) {
+      final start = _matchOffsets[index].clamp(0, text.length);
+      final end = (start + _queryLength).clamp(0, text.length);
+      if (start < cursor || start >= end) {
+        continue;
+      }
+
+      if (cursor < start) {
+        children.add(TextSpan(text: text.substring(cursor, start)));
+      }
+
+      children.add(
+        TextSpan(
+          text: text.substring(start, end),
+          style: TextStyle(
+            backgroundColor:
+                index == _currentMatchIndex ? _currentMatchColor : _matchColor,
+          ),
+        ),
+      );
+      cursor = end;
+    }
+
+    if (cursor < text.length) {
+      children.add(TextSpan(text: text.substring(cursor)));
+    }
+
+    return TextSpan(style: style, children: children);
+  }
+}
+
+bool _listEquals<T>(List<T> a, List<T> b) {
+  if (identical(a, b)) {
+    return true;
+  }
+  if (a.length != b.length) {
+    return false;
+  }
+  for (var index = 0; index < a.length; index++) {
+    if (a[index] != b[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 class _MarkdownSourceEditorState extends State<MarkdownSourceEditor> {
-  late final TextEditingController _textController;
+  late final _SearchHighlightTextController _textController;
   late final ScrollController _scrollController;
+  late final FocusNode _focusNode;
+  late final FocusNode _shortcutFocusNode;
+  late final FocusNode _findFocusNode;
+  late final TextEditingController _findController;
+  final GlobalKey _revealedLineKey = GlobalKey();
+  final GlobalKey _scrollViewportKey = GlobalKey();
+  Timer? _revealScrollTimer;
+  int? _revealedLineIndex;
+  int? _activeRevealRequestId;
+  List<int> _searchMatchOffsets = const [];
+  int _currentSearchMatchIndex = -1;
+  bool _isFindVisible = false;
 
   @override
   void initState() {
     super.initState();
-    _textController = TextEditingController(text: widget.markdown);
-    _scrollController = ScrollController();
+    _textController = _SearchHighlightTextController(text: widget.markdown);
+    _scrollController = ScrollController(
+      initialScrollOffset: widget.initialScrollOffset,
+    )..addListener(_handleScroll);
+    _focusNode = FocusNode();
+    _shortcutFocusNode = FocusNode();
+    _findFocusNode = FocusNode();
+    _findController = TextEditingController();
+    _updateRevealedLine(widget.revealRequest);
+    _scheduleRevealRequest(widget.revealRequest);
   }
 
   @override
@@ -2288,81 +2932,941 @@ class _MarkdownSourceEditorState extends State<MarkdownSourceEditor> {
         text: widget.markdown,
         selection: TextSelection.collapsed(offset: selectionOffset),
       );
+      if (_isFindVisible) {
+        _updateSourceSearch(_findController.text);
+      }
+    }
+
+    if (widget.revealRequest != null &&
+        widget.revealRequest?.id != oldWidget.revealRequest?.id) {
+      _updateRevealedLine(widget.revealRequest);
+      _scheduleRevealRequest(widget.revealRequest);
     }
   }
 
   @override
   void dispose() {
+    _revealScrollTimer?.cancel();
     _textController.dispose();
-    _scrollController.dispose();
+    _scrollController
+      ..removeListener(_handleScroll)
+      ..dispose();
+    _focusNode.dispose();
+    _shortcutFocusNode.dispose();
+    _findFocusNode.dispose();
+    _findController.dispose();
     super.dispose();
+  }
+
+  void _scheduleRevealRequest(SourceRevealRequest? request) {
+    if (request == null) {
+      return;
+    }
+
+    _activeRevealRequestId = request.id;
+    _revealScrollTimer?.cancel();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _activeRevealRequestId != request.id) {
+        return;
+      }
+
+      final offset =
+          request.offset.clamp(0, _textController.text.length).toInt();
+      _textController.selection = TextSelection.collapsed(offset: offset);
+      _focusNode.requestFocus();
+      widget.onRevealConsumed?.call(request.id);
+
+      _revealScrollTimer = Timer(const Duration(milliseconds: 180), () {
+        if (!mounted ||
+            _activeRevealRequestId != request.id ||
+            !_scrollController.hasClients) {
+          return;
+        }
+        _alignRevealedLine();
+      });
+    });
+  }
+
+  void _alignRevealedLine() {
+    if (!_scrollController.hasClients) {
+      return;
+    }
+
+    final lineContext = _revealedLineKey.currentContext;
+    final viewportContext = _scrollViewportKey.currentContext;
+    if (lineContext == null || viewportContext == null) {
+      return;
+    }
+    if (!lineContext.mounted || !viewportContext.mounted) {
+      return;
+    }
+
+    final lineBox = lineContext.findRenderObject() as RenderBox;
+    final viewportBox = viewportContext.findRenderObject() as RenderBox;
+    final lineOffsetFromTop =
+        lineBox.localToGlobal(Offset.zero).dy -
+        viewportBox.localToGlobal(Offset.zero).dy;
+    final targetOffset =
+        (_scrollController.offset + lineOffsetFromTop - 18)
+            .clamp(0.0, _scrollController.position.maxScrollExtent)
+            .toDouble();
+    _scrollController.animateTo(
+      targetOffset,
+      duration: const Duration(milliseconds: 160),
+      curve: Curves.easeOut,
+    );
+  }
+
+  void _handleScroll() {
+    widget.onScrollPositionChanged?.call(_scrollController.offset);
+  }
+
+  void _updateRevealedLine(SourceRevealRequest? request) {
+    if (request == null) {
+      _revealedLineIndex = null;
+      return;
+    }
+
+    final offset = request.offset.clamp(0, widget.markdown.length).toInt();
+    _revealedLineIndex =
+        '\n'.allMatches(widget.markdown.substring(0, offset)).length;
+  }
+
+  void _openFind() {
+    setState(() {
+      _isFindVisible = true;
+    });
+    if (_findController.text.trim().isNotEmpty) {
+      _updateSourceSearch(_findController.text);
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      _findFocusNode.requestFocus();
+      _findController.selection = TextSelection(
+        baseOffset: 0,
+        extentOffset: _findController.text.length,
+      );
+    });
+  }
+
+  void _closeFind() {
+    if (!_isFindVisible) {
+      return;
+    }
+
+    setState(() {
+      _isFindVisible = false;
+      _searchMatchOffsets = const [];
+      _currentSearchMatchIndex = -1;
+      _revealedLineIndex = null;
+    });
+    _textController.clearSearchHighlights();
+    _focusNode.requestFocus();
+  }
+
+  void _updateSourceSearch(String query) {
+    final normalizedQuery = query.trim().toLowerCase();
+    final source = _textController.text.toLowerCase();
+    final matches = <int>[];
+
+    if (normalizedQuery.isNotEmpty) {
+      var searchOffset = 0;
+      while (searchOffset <= source.length - normalizedQuery.length) {
+        final offset = source.indexOf(normalizedQuery, searchOffset);
+        if (offset == -1) {
+          break;
+        }
+        matches.add(offset);
+        searchOffset = offset + normalizedQuery.length;
+      }
+    }
+
+    setState(() {
+      _searchMatchOffsets = matches;
+      _currentSearchMatchIndex = matches.isEmpty ? -1 : 0;
+    });
+    _showCurrentSourceSearchMatch();
+  }
+
+  void _moveSourceSearchMatch(int change) {
+    if (_searchMatchOffsets.isEmpty) {
+      return;
+    }
+
+    setState(() {
+      _currentSearchMatchIndex =
+          (_currentSearchMatchIndex + change) % _searchMatchOffsets.length;
+      if (_currentSearchMatchIndex < 0) {
+        _currentSearchMatchIndex += _searchMatchOffsets.length;
+      }
+    });
+    _showCurrentSourceSearchMatch();
+  }
+
+  void _showCurrentSourceSearchMatch() {
+    if (_currentSearchMatchIndex < 0 ||
+        _currentSearchMatchIndex >= _searchMatchOffsets.length) {
+      return;
+    }
+
+    final offset = _searchMatchOffsets[_currentSearchMatchIndex];
+    final queryLength = _findController.text.trim().length;
+    _textController.selection = TextSelection(
+      baseOffset: offset,
+      extentOffset: offset + queryLength,
+    );
+    setState(() {
+      _revealedLineIndex =
+          '\n'.allMatches(_textController.text.substring(0, offset)).length;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _alignRevealedLine();
+        _findFocusNode.requestFocus();
+      }
+    });
   }
 
   @override
   Widget build(BuildContext context) {
     final colors = context.editorColors;
+    final sourceSearchHighlight =
+        Theme.of(context).brightness == Brightness.dark
+            ? const Color(0xFFB36B00)
+            : const Color(0xFFFFC928);
+    final sourceSearchMatchHighlight =
+        Theme.of(context).brightness == Brightness.dark
+            ? const Color(0x665A4520)
+            : const Color(0x66FFE58A);
+    _textController.updateSearchHighlights(
+      matchOffsets: _isFindVisible ? _searchMatchOffsets : const [],
+      currentMatchIndex: _currentSearchMatchIndex,
+      queryLength: _findController.text.trim().length,
+      matchColor: sourceSearchMatchHighlight,
+      currentMatchColor: sourceSearchHighlight,
+    );
     final lineCount =
         _textController.text.isEmpty
             ? 1
             : '\n'.allMatches(_textController.text).length + 1;
 
-    return DecoratedBox(
-      decoration: BoxDecoration(color: colors.editor),
-      child: Scrollbar(
-        controller: _scrollController,
-        thumbVisibility: true,
-        child: SingleChildScrollView(
-          controller: _scrollController,
-          padding: const EdgeInsets.fromLTRB(0, 18, 24, 24),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              SizedBox(
-                width: 62,
-                child: Padding(
-                  padding: const EdgeInsets.only(right: 12),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      for (var line = 1; line <= lineCount; line++)
-                        Text(
-                          '$line',
-                          textAlign: TextAlign.right,
-                          style: TextStyle(
-                            color: colors.lineNumber,
-                            fontFamily: 'Menlo',
-                            fontSize: 13,
-                            height: 1.55,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        return DecoratedBox(
+          decoration: BoxDecoration(color: colors.editor),
+          child: CallbackShortcuts(
+            bindings: <ShortcutActivator, VoidCallback>{
+              const SingleActivator(LogicalKeyboardKey.keyF, meta: true):
+                  _openFind,
+              const SingleActivator(LogicalKeyboardKey.keyF, control: true):
+                  _openFind,
+              const SingleActivator(LogicalKeyboardKey.escape): _closeFind,
+            },
+            child: Focus(
+              autofocus: true,
+              focusNode: _shortcutFocusNode,
+              child: Stack(
+                children: [
+                  Positioned.fill(
+                    child: Scrollbar(
+                      controller: _scrollController,
+                      thumbVisibility: true,
+                      child: SizedBox(
+                        key: _scrollViewportKey,
+                        child: SingleChildScrollView(
+                          key: const ValueKey<String>(
+                            'source-editor-scroll-view',
+                          ),
+                          controller: _scrollController,
+                          padding: const EdgeInsets.fromLTRB(0, 18, 24, 24),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  SizedBox(
+                                    width: 62,
+                                    child: Padding(
+                                      padding: const EdgeInsets.only(right: 12),
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.stretch,
+                                        children: [
+                                          for (
+                                            var line = 1;
+                                            line <= lineCount;
+                                            line++
+                                          )
+                                            Text(
+                                              key:
+                                                  line - 1 == _revealedLineIndex
+                                                      ? _revealedLineKey
+                                                      : null,
+                                              '$line',
+                                              textAlign: TextAlign.right,
+                                              style: TextStyle(
+                                                color: colors.lineNumber,
+                                                fontFamily: 'Menlo',
+                                                fontSize: 13,
+                                                height: 1.55,
+                                              ),
+                                            ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                  Expanded(
+                                    child: TextSelectionTheme(
+                                      key: const ValueKey<String>(
+                                        'source-search-selection-theme',
+                                      ),
+                                      data: TextSelectionThemeData(
+                                        selectionColor: sourceSearchHighlight,
+                                      ),
+                                      child: TextField(
+                                        controller: _textController,
+                                        focusNode: _focusNode,
+                                        autofocus: false,
+                                        minLines: null,
+                                        maxLines: null,
+                                        keyboardType: TextInputType.multiline,
+                                        cursorColor: colors.accent,
+                                        style: TextStyle(
+                                          color: colors.primaryText,
+                                          fontFamily: 'Menlo',
+                                          fontSize: 13,
+                                          height: 1.55,
+                                        ),
+                                        decoration: const InputDecoration(
+                                          border: InputBorder.none,
+                                          isCollapsed: true,
+                                          contentPadding: EdgeInsets.zero,
+                                        ),
+                                        onChanged: (value) {
+                                          widget.onChanged(
+                                            widget.filePath,
+                                            value,
+                                          );
+                                          if (_isFindVisible) {
+                                            _updateSourceSearch(
+                                              _findController.text,
+                                            );
+                                          }
+                                        },
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              SizedBox(height: constraints.maxHeight),
+                            ],
                           ),
                         ),
-                    ],
+                      ),
+                    ),
+                  ),
+                  if (_isFindVisible)
+                    _EditorFindBar(
+                      keyPrefix: 'source',
+                      controller: _findController,
+                      focusNode: _findFocusNode,
+                      matchCount: _searchMatchOffsets.length,
+                      currentMatchIndex: _currentSearchMatchIndex,
+                      onChanged: _updateSourceSearch,
+                      onPrevious: () => _moveSourceSearchMatch(-1),
+                      onNext: () => _moveSourceSearchMatch(1),
+                      onClose: _closeFind,
+                    ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class PreviewPane extends StatefulWidget {
+  const PreviewPane({
+    super.key,
+    this.showPanelHeader = true,
+    this.selectable = true,
+    this.revealOnDoubleTap = true,
+    this.selectionToolbarEditEnabled = false,
+    this.contentPadding = const EdgeInsets.fromLTRB(52, 28, 52, 52),
+    this.initialScrollOffset = 0,
+    this.onScrollPositionChanged,
+    required this.markdown,
+    required this.imageDirectory,
+    required this.onTapLink,
+    required this.onRevealSource,
+    this.onOpenSource,
+    this.onLongPressSource,
+  });
+
+  final bool showPanelHeader;
+  final bool selectable;
+  final bool revealOnDoubleTap;
+  final bool selectionToolbarEditEnabled;
+  final EdgeInsets contentPadding;
+  final double initialScrollOffset;
+  final ValueChanged<double>? onScrollPositionChanged;
+  final String markdown;
+  final String? imageDirectory;
+  final Future<void> Function(String? href) onTapLink;
+  final ValueChanged<int> onRevealSource;
+  final VoidCallback? onOpenSource;
+  final ValueChanged<int>? onLongPressSource;
+
+  @override
+  State<PreviewPane> createState() => _PreviewPaneState();
+}
+
+class _PreviewPaneState extends State<PreviewPane> {
+  late final ScrollController _scrollController;
+  late final FocusNode _previewFocusNode;
+  late final FocusNode _findFocusNode;
+  late final TextEditingController _findController;
+  final List<GlobalKey> _blockKeys = [];
+  List<_PreviewSearchMatch> _searchMatches = const [];
+  int _currentSearchMatchIndex = -1;
+  int? _lastInteractionSourceOffset;
+  String _searchQuery = '';
+  bool _isFindVisible = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _scrollController = ScrollController(
+      initialScrollOffset: widget.initialScrollOffset,
+    )..addListener(_handleScroll);
+    _previewFocusNode = FocusNode();
+    _findFocusNode = FocusNode();
+    _findController = TextEditingController();
+  }
+
+  @override
+  void didUpdateWidget(covariant PreviewPane oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.markdown != oldWidget.markdown && _isFindVisible) {
+      _updateSearch(_findController.text);
+    }
+  }
+
+  @override
+  void dispose() {
+    _scrollController
+      ..removeListener(_handleScroll)
+      ..dispose();
+    _previewFocusNode.dispose();
+    _findFocusNode.dispose();
+    _findController.dispose();
+    super.dispose();
+  }
+
+  void _handleScroll() {
+    widget.onScrollPositionChanged?.call(_scrollController.offset);
+  }
+
+  void _openFind() {
+    if (!widget.selectable) {
+      return;
+    }
+
+    setState(() {
+      _isFindVisible = true;
+    });
+    if (_findController.text.trim().isNotEmpty) {
+      _updateSearch(_findController.text);
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      _findFocusNode.requestFocus();
+      _findController.selection = TextSelection(
+        baseOffset: 0,
+        extentOffset: _findController.text.length,
+      );
+    });
+  }
+
+  void _closeFind() {
+    if (!_isFindVisible) {
+      return;
+    }
+
+    setState(() {
+      _isFindVisible = false;
+      _searchQuery = '';
+      _searchMatches = const [];
+      _currentSearchMatchIndex = -1;
+    });
+    _previewFocusNode.requestFocus();
+  }
+
+  void _updateSearch(String query) {
+    final normalizedQuery = query.trim().toLowerCase();
+    final matches = <_PreviewSearchMatch>[];
+
+    if (normalizedQuery.isNotEmpty) {
+      final blocks = _splitMarkdownPreviewBlocks(widget.markdown);
+      for (var blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
+        final source = blocks[blockIndex].markdown.toLowerCase();
+        var searchOffset = 0;
+        var occurrenceIndexInBlock = 0;
+        while (searchOffset <= source.length - normalizedQuery.length) {
+          final offset = source.indexOf(normalizedQuery, searchOffset);
+          if (offset == -1) {
+            break;
+          }
+          matches.add(
+            _PreviewSearchMatch(
+              blockIndex: blockIndex,
+              occurrenceIndexInBlock: occurrenceIndexInBlock,
+            ),
+          );
+          occurrenceIndexInBlock++;
+          searchOffset = offset + normalizedQuery.length;
+        }
+      }
+    }
+
+    setState(() {
+      _searchQuery = query.trim();
+      _searchMatches = matches;
+      _currentSearchMatchIndex = matches.isEmpty ? -1 : 0;
+    });
+    _scrollToCurrentSearchMatch();
+  }
+
+  void _moveSearchMatch(int change) {
+    if (_searchMatches.isEmpty) {
+      return;
+    }
+
+    setState(() {
+      _currentSearchMatchIndex =
+          (_currentSearchMatchIndex + change) % _searchMatches.length;
+      if (_currentSearchMatchIndex < 0) {
+        _currentSearchMatchIndex += _searchMatches.length;
+      }
+    });
+    _scrollToCurrentSearchMatch();
+  }
+
+  void _scrollToCurrentSearchMatch() {
+    if (_currentSearchMatchIndex < 0 ||
+        _currentSearchMatchIndex >= _searchMatches.length) {
+      return;
+    }
+
+    final blockIndex = _searchMatches[_currentSearchMatchIndex].blockIndex;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || blockIndex >= _blockKeys.length) {
+        return;
+      }
+      final blockContext = _blockKeys[blockIndex].currentContext;
+      if (blockContext == null) {
+        return;
+      }
+      Scrollable.ensureVisible(
+        blockContext,
+        alignment: 0.1,
+        duration: const Duration(milliseconds: 160),
+        curve: Curves.easeOut,
+      );
+    });
+  }
+
+  Widget _buildSelectionContextMenu(
+    BuildContext context,
+    SelectableRegionState selectableRegionState,
+  ) {
+    final buttonItems = List<ContextMenuButtonItem>.of(
+      selectableRegionState.contextMenuButtonItems,
+    );
+
+    if (widget.selectionToolbarEditEnabled) {
+      buttonItems.add(
+        ContextMenuButtonItem(
+          label: 'Edit',
+          onPressed: () {
+            selectableRegionState.hideToolbar();
+            final sourceOffset = _lastInteractionSourceOffset;
+            if (sourceOffset == null) {
+              widget.onOpenSource?.call();
+              return;
+            }
+            widget.onRevealSource(sourceOffset);
+          },
+        ),
+      );
+    }
+
+    return AdaptiveTextSelectionToolbar.buttonItems(
+      anchors: selectableRegionState.contextMenuAnchors,
+      buttonItems: buttonItems,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = context.editorColors;
+    final blocks = _splitMarkdownPreviewBlocks(widget.markdown);
+    final styleSheet = buildMarkdownStyleSheet(colors);
+    final normalizedSearchQuery = _searchQuery;
+    final previewSearchHighlight =
+        Theme.of(context).brightness == Brightness.dark
+            ? const Color(0xFFB36B00)
+            : const Color(0xFFFFC928);
+    while (_blockKeys.length < blocks.length) {
+      _blockKeys.add(GlobalKey());
+    }
+    if (_blockKeys.length > blocks.length) {
+      _blockKeys.removeRange(blocks.length, _blockKeys.length);
+    }
+
+    final currentBlockIndex =
+        _currentSearchMatchIndex < 0
+            ? -1
+            : _searchMatches[_currentSearchMatchIndex].blockIndex;
+    final scrollContent = ListView(
+      controller: _scrollController,
+      padding: widget.contentPadding,
+      children: [
+        for (var index = 0; index < blocks.length; index++) ...[
+          if (blocks[index].addSpacingBefore)
+            SizedBox(height: styleSheet.blockSpacing ?? 0),
+          DecoratedBox(
+            key: _blockKeys[index],
+            decoration: BoxDecoration(
+              color: Colors.transparent,
+              border: Border.all(color: Colors.transparent, width: 1.5),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: MouseRegion(
+              cursor: SystemMouseCursors.text,
+              child: Listener(
+                onPointerDown: (_) {
+                  _lastInteractionSourceOffset = blocks[index].sourceOffset;
+                },
+                child: GestureDetector(
+                  behavior: HitTestBehavior.translucent,
+                  onTapDown:
+                      (_) =>
+                          _lastInteractionSourceOffset =
+                              blocks[index].sourceOffset,
+                  onDoubleTap:
+                      widget.revealOnDoubleTap
+                          ? () =>
+                              widget.onRevealSource(blocks[index].sourceOffset)
+                          : null,
+                  onLongPress:
+                      widget.onLongPressSource == null
+                          ? null
+                          : () => widget.onLongPressSource!(
+                            blocks[index].sourceOffset,
+                          ),
+                  child: MarkdownBody(
+                    key: ValueKey<String>(
+                      'preview-markdown:$index:$normalizedSearchQuery:'
+                      '$_currentSearchMatchIndex',
+                    ),
+                    selectable: false,
+                    data: blocks[index].markdown,
+                    imageDirectory: widget.imageDirectory,
+                    onTapLink: (_, href, __) => widget.onTapLink(href),
+                    styleSheet: styleSheet,
+                    builders:
+                        normalizedSearchQuery.isEmpty
+                            ? const <String, MarkdownElementBuilder>{}
+                            : {
+                              for (final tag in _previewSearchTextTags)
+                                tag: _MarkdownSearchHighlightBuilder(
+                                  query: normalizedSearchQuery,
+                                  currentMatchOccurrenceIndex:
+                                      currentBlockIndex == index
+                                          ? _searchMatches[_currentSearchMatchIndex]
+                                              .occurrenceIndexInBlock
+                                          : null,
+                                  currentMatchColor: previewSearchHighlight,
+                                ),
+                            },
                   ),
                 ),
               ),
-              Expanded(
-                child: TextField(
-                  controller: _textController,
-                  autofocus: true,
-                  minLines: null,
-                  maxLines: null,
-                  keyboardType: TextInputType.multiline,
-                  cursorColor: colors.accent,
-                  style: TextStyle(
-                    color: colors.primaryText,
-                    fontFamily: 'Menlo',
-                    fontSize: 13,
-                    height: 1.55,
-                  ),
-                  decoration: const InputDecoration(
-                    border: InputBorder.none,
-                    isCollapsed: true,
-                    contentPadding: EdgeInsets.zero,
-                  ),
-                  onChanged:
-                      (value) => widget.onChanged(widget.filePath, value),
+            ),
+          ),
+        ],
+      ],
+    );
+    final previewContent =
+        widget.selectable
+            ? SelectionArea(
+              contextMenuBuilder: _buildSelectionContextMenu,
+              child: scrollContent,
+            )
+            : scrollContent;
+
+    return Column(
+      children: [
+        if (widget.showPanelHeader) const PanelHeader(title: 'PREVIEW'),
+        Expanded(
+          child: DecoratedBox(
+            decoration: BoxDecoration(color: colors.preview),
+            child: CallbackShortcuts(
+              bindings: <ShortcutActivator, VoidCallback>{
+                const SingleActivator(LogicalKeyboardKey.keyF, meta: true):
+                    _openFind,
+                const SingleActivator(LogicalKeyboardKey.keyF, control: true):
+                    _openFind,
+                const SingleActivator(LogicalKeyboardKey.escape): _closeFind,
+              },
+              child: Focus(
+                autofocus: widget.selectable,
+                focusNode: _previewFocusNode,
+                child: Stack(
+                  children: [
+                    Positioned.fill(
+                      child: Listener(
+                        onPointerDown: (_) => _previewFocusNode.requestFocus(),
+                        child: previewContent,
+                      ),
+                    ),
+                    if (_isFindVisible)
+                      _EditorFindBar(
+                        keyPrefix: 'preview',
+                        controller: _findController,
+                        focusNode: _findFocusNode,
+                        matchCount: _searchMatches.length,
+                        currentMatchIndex: _currentSearchMatchIndex,
+                        onChanged: _updateSearch,
+                        onPrevious: () => _moveSearchMatch(-1),
+                        onNext: () => _moveSearchMatch(1),
+                        onClose: _closeFind,
+                      ),
+                  ],
                 ),
               ),
-            ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _PreviewSearchMatch {
+  const _PreviewSearchMatch({
+    required this.blockIndex,
+    required this.occurrenceIndexInBlock,
+  });
+
+  final int blockIndex;
+  final int occurrenceIndexInBlock;
+}
+
+const List<String> _previewSearchTextTags = [
+  'p',
+  'li',
+  'blockquote',
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  'h5',
+  'h6',
+  'strong',
+  'em',
+  'del',
+  'code',
+];
+
+class _MarkdownSearchHighlightBuilder extends MarkdownElementBuilder {
+  _MarkdownSearchHighlightBuilder({
+    required this.query,
+    required this.currentMatchOccurrenceIndex,
+    required this.currentMatchColor,
+  });
+
+  final String query;
+  final int? currentMatchOccurrenceIndex;
+  final Color currentMatchColor;
+  int _visitedOccurrenceCount = 0;
+
+  @override
+  Widget? visitText(dynamic text, TextStyle? preferredStyle) {
+    final source = text.text as String;
+    final normalizedQuery = query.toLowerCase();
+    if (normalizedQuery.isEmpty || source.isEmpty) {
+      return null;
+    }
+
+    final normalizedSource = source.toLowerCase();
+    final spans = <TextSpan>[];
+    var cursor = 0;
+    var searchOffset = 0;
+
+    while (searchOffset <= normalizedSource.length - normalizedQuery.length) {
+      final start = normalizedSource.indexOf(normalizedQuery, searchOffset);
+      if (start == -1) {
+        break;
+      }
+      final end = start + normalizedQuery.length;
+
+      if (cursor < start) {
+        spans.add(
+          TextSpan(
+            text: source.substring(cursor, start),
+            style: preferredStyle,
+          ),
+        );
+      }
+
+      final isCurrent = _visitedOccurrenceCount == currentMatchOccurrenceIndex;
+      final highlightColor = isCurrent ? currentMatchColor : null;
+      spans.add(
+        TextSpan(
+          text: source.substring(start, end),
+          style:
+              highlightColor == null
+                  ? preferredStyle
+                  : (preferredStyle ?? const TextStyle()).copyWith(
+                    backgroundColor: highlightColor,
+                  ),
+        ),
+      );
+
+      _visitedOccurrenceCount++;
+      cursor = end;
+      searchOffset = end;
+    }
+
+    if (spans.isEmpty) {
+      return Text.rich(TextSpan(text: source, style: preferredStyle));
+    }
+
+    if (cursor < source.length) {
+      spans.add(
+        TextSpan(text: source.substring(cursor), style: preferredStyle),
+      );
+    }
+
+    return Text.rich(TextSpan(children: spans));
+  }
+}
+
+class _EditorFindBar extends StatelessWidget {
+  const _EditorFindBar({
+    required this.keyPrefix,
+    required this.controller,
+    required this.focusNode,
+    required this.matchCount,
+    required this.currentMatchIndex,
+    required this.onChanged,
+    required this.onPrevious,
+    required this.onNext,
+    required this.onClose,
+  });
+
+  final String keyPrefix;
+  final TextEditingController controller;
+  final FocusNode focusNode;
+  final int matchCount;
+  final int currentMatchIndex;
+  final ValueChanged<String> onChanged;
+  final VoidCallback onPrevious;
+  final VoidCallback onNext;
+  final VoidCallback onClose;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = context.editorColors;
+    final resultText =
+        controller.text.trim().isEmpty
+            ? ''
+            : matchCount == 0
+            ? 'No results'
+            : '${currentMatchIndex + 1}/$matchCount';
+
+    return Positioned(
+      key: ValueKey<String>('$keyPrefix-find-bar'),
+      top: 10,
+      left: 14,
+      right: 14,
+      child: Align(
+        alignment: Alignment.topRight,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 330),
+          child: Material(
+            color: colors.panelHeader,
+            borderRadius: BorderRadius.circular(6),
+            elevation: 5,
+            child: Container(
+              height: 40,
+              padding: const EdgeInsets.only(left: 10, right: 4),
+              decoration: BoxDecoration(
+                border: Border.all(color: colors.border),
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      key: ValueKey<String>('$keyPrefix-find-input'),
+                      controller: controller,
+                      focusNode: focusNode,
+                      autofocus: true,
+                      textInputAction: TextInputAction.search,
+                      decoration: const InputDecoration(
+                        hintText: 'Find',
+                        border: InputBorder.none,
+                        isDense: true,
+                      ),
+                      onChanged: onChanged,
+                      onSubmitted: (_) {
+                        onNext();
+                        WidgetsBinding.instance.addPostFrameCallback((_) {
+                          focusNode.requestFocus();
+                        });
+                      },
+                    ),
+                  ),
+                  SizedBox(
+                    width: 58,
+                    child: Text(
+                      resultText,
+                      key: ValueKey<String>('$keyPrefix-find-results'),
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: colors.secondaryText,
+                        fontSize: 11,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Previous match',
+                    icon: const Icon(Icons.keyboard_arrow_up, size: 18),
+                    onPressed: onPrevious,
+                  ),
+                  IconButton(
+                    tooltip: 'Next match',
+                    icon: const Icon(Icons.keyboard_arrow_down, size: 18),
+                    onPressed: onNext,
+                  ),
+                  IconButton(
+                    tooltip: 'Close',
+                    icon: const Icon(Icons.close, size: 16),
+                    onPressed: onClose,
+                  ),
+                ],
+              ),
+            ),
           ),
         ),
       ),
@@ -2370,41 +3874,146 @@ class _MarkdownSourceEditorState extends State<MarkdownSourceEditor> {
   }
 }
 
-class PreviewPane extends StatelessWidget {
-  const PreviewPane({
-    super.key,
+class _MarkdownPreviewBlock {
+  const _MarkdownPreviewBlock({
+    required this.sourceOffset,
     required this.markdown,
-    required this.imageDirectory,
-    required this.onTapLink,
+    required this.addSpacingBefore,
   });
 
+  final int sourceOffset;
   final String markdown;
-  final String? imageDirectory;
-  final Future<void> Function(String? href) onTapLink;
+  final bool addSpacingBefore;
+}
 
-  @override
-  Widget build(BuildContext context) {
-    final colors = context.editorColors;
+List<_MarkdownPreviewBlock> _splitMarkdownPreviewBlocks(String markdown) {
+  final blocks = <_MarkdownPreviewBlock>[];
+  final lines = RegExp(r'.*(?:\n|$)')
+      .allMatches(markdown)
+      .where((match) => match.group(0)!.isNotEmpty)
+      .toList(growable: false);
+  var index = 0;
+  var needsSpacing = false;
+  var previousWasListItem = false;
 
-    return Column(
-      children: [
-        const PanelHeader(title: 'PREVIEW'),
-        Expanded(
-          child: DecoratedBox(
-            decoration: BoxDecoration(color: colors.preview),
-            child: Markdown(
-              selectable: true,
-              data: markdown,
-              imageDirectory: imageDirectory,
-              onTapLink: (_, href, __) => onTapLink(href),
-              padding: const EdgeInsets.fromLTRB(52, 28, 52, 52),
-              styleSheet: buildMarkdownStyleSheet(colors),
-            ),
-          ),
-        ),
-      ],
+  while (index < lines.length) {
+    final line = lines[index].group(0)!;
+    final text = line.trimRight();
+
+    if (text.trim().isEmpty) {
+      needsSpacing = blocks.isNotEmpty;
+      previousWasListItem = false;
+      index++;
+      continue;
+    }
+
+    final startIndex = index;
+    final isListItem = _markdownListMarker.firstMatch(text) != null;
+
+    if (_markdownFenceMarker.hasMatch(text)) {
+      index++;
+      while (index < lines.length) {
+        final nextText = lines[index].group(0)!.trimRight();
+        index++;
+        if (_markdownFenceMarker.hasMatch(nextText)) {
+          break;
+        }
+      }
+    } else if (isListItem) {
+      final baseIndent = _leadingWhitespaceLength(text);
+      index++;
+      while (index < lines.length) {
+        final nextText = lines[index].group(0)!.trimRight();
+        if (nextText.trim().isEmpty) {
+          break;
+        }
+
+        final nextListMatch = _markdownListMarker.firstMatch(nextText);
+        if (nextListMatch != null &&
+            _leadingWhitespaceLength(nextText) <= baseIndent) {
+          break;
+        }
+        if (_startsStandaloneMarkdownBlock(nextText)) {
+          break;
+        }
+        index++;
+      }
+    } else if (_isSingleLineMarkdownBlock(text)) {
+      index++;
+    } else if (_markdownBlockquote.hasMatch(text)) {
+      index++;
+      while (index < lines.length &&
+          _markdownBlockquote.hasMatch(lines[index].group(0)!.trimRight())) {
+        index++;
+      }
+    } else if (_looksLikeTableRow(text)) {
+      index++;
+      while (index < lines.length &&
+          _looksLikeTableRow(lines[index].group(0)!.trimRight())) {
+        index++;
+      }
+    } else {
+      index++;
+      while (index < lines.length) {
+        final nextText = lines[index].group(0)!.trimRight();
+        if (nextText.trim().isEmpty ||
+            _startsStandaloneMarkdownBlock(nextText)) {
+          break;
+        }
+        index++;
+      }
+    }
+
+    final source = StringBuffer();
+    for (var lineIndex = startIndex; lineIndex < index; lineIndex++) {
+      source.write(lines[lineIndex].group(0)!);
+    }
+
+    blocks.add(
+      _MarkdownPreviewBlock(
+        sourceOffset: lines[startIndex].start,
+        markdown: source.toString(),
+        addSpacingBefore:
+            blocks.isNotEmpty &&
+            (needsSpacing || !isListItem || !previousWasListItem),
+      ),
     );
+    needsSpacing = false;
+    previousWasListItem = isListItem;
   }
+
+  return blocks;
+}
+
+final RegExp _markdownFenceMarker = RegExp(r'^\s*(`{3,}|~{3,})');
+final RegExp _markdownListMarker = RegExp(
+  r'^(\s*)(?:[-+*]|\d+[.)])\s+(?:\[[ xX]\]\s+)?',
+);
+final RegExp _markdownHeading = RegExp(r'^\s{0,3}#{1,6}\s+');
+final RegExp _markdownHorizontalRule = RegExp(
+  r'^\s{0,3}(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$',
+);
+final RegExp _markdownBlockquote = RegExp(r'^\s{0,3}>\s?');
+
+bool _startsStandaloneMarkdownBlock(String line) {
+  return _markdownFenceMarker.hasMatch(line) ||
+      _markdownListMarker.hasMatch(line) ||
+      _isSingleLineMarkdownBlock(line) ||
+      _markdownBlockquote.hasMatch(line) ||
+      _looksLikeTableRow(line);
+}
+
+bool _isSingleLineMarkdownBlock(String line) {
+  return _markdownHeading.hasMatch(line) ||
+      _markdownHorizontalRule.hasMatch(line);
+}
+
+bool _looksLikeTableRow(String line) {
+  return line.trimLeft().startsWith('|') && line.contains('|');
+}
+
+int _leadingWhitespaceLength(String line) {
+  return RegExp(r'^\s*').firstMatch(line)!.group(0)!.length;
 }
 
 class PanelHeader extends StatelessWidget {
@@ -2571,7 +4180,7 @@ class StatusBar extends StatelessWidget {
                 scale: 0.75,
                 child: Switch(
                   value: autoReload,
-                  activeColor: Colors.white,
+                  activeThumbColor: Colors.white,
                   activeTrackColor: Colors.white38,
                   inactiveThumbColor: Colors.white70,
                   inactiveTrackColor: Colors.black26,
